@@ -12168,6 +12168,29 @@ int ObLogPlan::prepare_text_retrieval_merge(const ObIArray<ObRawExpr *> &merge_m
   return ret;
 }
 
+// Only a truth-value consumer can replace positive natural-language scores
+// with a hit marker. Score projections, comparisons and other uses stay scored.
+static int match_requires_score(const ObRawExpr *expr,
+                               const ObRawExpr *match,
+                               bool &required)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (expr == match) {
+    required = true;
+  } else if (T_OP_BOOL == expr->get_expr_type() && expr->get_param_count() == 1
+             && expr->get_param_expr(0) == match) {
+    // Natural-language MATCH has a strictly positive score for every hit.
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !required && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(match_requires_score(expr->get_param_expr(i), match, required)))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
                                            const uint64_t index_table_id,
                                            ObMatchFunRawExpr *match_against,
@@ -12185,7 +12208,6 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
   bool need_calc_relevance = true;
-  ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
     ret = OB_INVALID_ARGUMENT;
@@ -12252,18 +12274,25 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    /*
-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
-                                                              get_stmt(),
-                                                              match_against,
-                                                              need_calc_relevance,
-                                                              constraints))) {
-      LOG_WARN("failed to check need calc relevance", K(ret));
-    } else if (!need_calc_relevance &&
-               OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
-      LOG_WARN("failed to append array no dup", K(ret));
+    // Start with scalar aggregates: they do not depend on implicit relevance
+    // ordering. Keep nested queries and score-sensitive expressions unchanged.
+    if (get_stmt()->is_select_stmt()
+        && static_cast<const ObSelectStmt *>(get_stmt())->is_scala_group_by()
+        && get_stmt()->get_subquery_expr_size() == 0
+        && get_stmt()->get_table_size() == 1
+        && get_stmt()->get_table_item(0)->is_basic_table()
+        && get_stmt()->get_match_exprs().count() == 1
+        && match_against->get_mode_flag() == NATURAL_LANGUAGE_MODE) {
+      ObSEArray<ObRawExpr *, 8> exprs;
+      if (OB_FAIL(get_stmt()->get_relation_exprs(exprs))) {
+      } else {
+        need_calc_relevance = false;
+        for (int64_t i = 0; OB_SUCC(ret) && !need_calc_relevance && i < exprs.count(); ++i) {
+          if (OB_FAIL(match_requires_score(exprs.at(i), match_against, need_calc_relevance))) {
+          }
+        }
+      }
     }
-    */
     tr_info.match_expr_ = match_against;
     tr_info.inv_idx_tid_ = inv_idx_tid;
     tr_info.fwd_idx_tid_ = fwd_idx_tid;

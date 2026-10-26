@@ -20,6 +20,7 @@
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
+#include <mutex>
 
 namespace oceanbase
 {
@@ -93,13 +94,19 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
+class SharedBuiltinFTDict;
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(),
+      shared_dict_lock_(), shared_main_(nullptr), shared_quan_(nullptr) {}
   ~ObFTDictHub() {}
 
   int init();
+
+  // Readers are immutable and pinned until hub shutdown; parsing state is private.
+  int get_builtin_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
 
   int destroy();
 
@@ -118,6 +125,9 @@ private:
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  std::mutex shared_dict_lock_;
+  SharedBuiltinFTDict *shared_main_;
+  SharedBuiltinFTDict *shared_quan_;
 };
 
 } //  namespace storage

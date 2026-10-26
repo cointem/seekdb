@@ -55,10 +55,12 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), hit_union_enabled_(false), hit_union_inited_(false),
+      hit_id_cmp_(nullptr) {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
+  int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
 protected:
@@ -67,6 +69,9 @@ protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  bool hit_union_enabled_;
+  bool hit_union_inited_;
+  common::ObDatumCmpFuncType hit_id_cmp_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };

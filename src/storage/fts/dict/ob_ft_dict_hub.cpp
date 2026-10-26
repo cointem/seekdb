@@ -28,6 +28,72 @@ namespace oceanbase
 {
 namespace storage
 {
+// Own cache handles for as long as any parser can borrow the corresponding
+// read-only DAT readers. The built-in dictionaries have no runtime updates.
+class SharedBuiltinFTDict
+{
+public:
+  SharedBuiltinFTDict()
+      : allocator_(lib::ObMemAttr("SharedFTDict")), container_(allocator_), dict_(nullptr) {}
+  ~SharedBuiltinFTDict()
+  {
+    if (nullptr != dict_) {
+      dict_->~ObFTRangeDict();
+      dict_ = nullptr;
+    }
+    container_.reset();
+  }
+  int init(ObFTDictHub &hub, const ObFTDictDesc &desc)
+  {
+    int ret = hub.load_cache(desc, container_);
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = hub.build_cache(desc, container_);
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(dict_ = OB_NEWx(ObFTRangeDict, &allocator_, allocator_, &container_, desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(dict_->init())) {
+    }
+    return ret;
+  }
+  ObIFTDict *get() const { return dict_; }
+private:
+  ObArenaAllocator allocator_;
+  ObFTCacheRangeContainer container_;
+  ObFTRangeDict *dict_;
+};
+
+int ObFTDictHub::get_builtin_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  std::lock_guard<std::mutex> guard(shared_dict_lock_);
+  SharedBuiltinFTDict **slot = nullptr;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (desc.type_ == ObFTDictType::DICT_IK_MAIN) {
+    slot = &shared_main_;
+  } else if (desc.type_ == ObFTDictType::DICT_IK_QUAN) {
+    slot = &shared_quan_;
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  if (OB_SUCC(ret) && nullptr == *slot) {
+    SharedBuiltinFTDict *candidate = OB_NEW(SharedBuiltinFTDict, "SharedFTDict");
+    if (OB_ISNULL(candidate)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(candidate->init(*this, desc))) {
+      OB_DELETE(SharedBuiltinFTDict, "SharedFTDict", candidate);
+    } else {
+      *slot = candidate;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    dict = (*slot)->get();
+  }
+  return ret;
+}
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
@@ -43,6 +109,16 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  std::lock_guard<std::mutex> guard(shared_dict_lock_);
+  if (nullptr != shared_main_) {
+    OB_DELETE(SharedBuiltinFTDict, "SharedFTDict", shared_main_);
+    shared_main_ = nullptr;
+  }
+  if (nullptr != shared_quan_) {
+    OB_DELETE(SharedBuiltinFTDict, "SharedFTDict", shared_quan_);
+    shared_quan_ = nullptr;
+  }
+  dict_map_.destroy();
   is_inited_ = false;
   return ret;
 }

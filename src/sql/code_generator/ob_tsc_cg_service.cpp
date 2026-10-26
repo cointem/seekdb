@@ -1888,7 +1888,7 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       ir_scan_ctdef->children_cnt_ = 1;
-      ir_scan_ctdef->children_[0] = &scan_ctdef;
+      ir_scan_ctdef->children_[0] = inv_idx_scan_ctdef;
     }
   }
 
