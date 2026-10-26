@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "sql/printer/ob_schema_printer.h"
+#include "share/schema/ai_column_schema.h"
 #include "share/ob_autoincrement_service.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 
@@ -231,7 +232,27 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
             SHARE_SCHEMA_LOG(WARN, "fail to print geometry srid", K(ret), K(srid));
           }
         }
-        if (OB_SUCC(ret) && !col->is_generated_column()) {
+        if (OB_SUCC(ret) && (col->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+          AiColumnDefinition definition;
+          definition.name = AiColumnDefinition::string(col->get_column_name_str());
+          const auto *spec = table_schema.get_column_schema(definition.hidden("spec").c_str());
+          if (spec == nullptr) { ret = OB_SCHEMA_ERROR; }
+          else if (OB_FAIL(definition.load(spec->get_cur_default_value().get_string()))) {
+          } else {
+            std::string expression = std::string(definition.embedding ? "AI_EMBED(" : "AI_COMPLETE(")
+                + "'";
+            for (char c : definition.model) {
+              if (c == '\'' || (c == '\\' && !(sql_mode & SMO_NO_BACKSLASH_ESCAPES))) { expression += c; }
+              expression += c;
+            }
+            expression += "'," + definition.prompt;
+            if (!definition.argument.empty()) { expression += "," + definition.argument; }
+            expression += ")";
+            ret = databuff_printf(buf, buf_len, pos,
+                " AI COLUMN (%s) WITH (sync_mode='async', max_retries=%ld)", expression.c_str(), definition.retries);
+          }
+        }
+        if (OB_SUCC(ret) && !col->is_generated_column() && (col->get_column_flags() & AI_COLUMN_FLAG) == 0) {
           //if column is not permit null and default value does not specify , don't  display DEFAULT NULL
           if (OB_SUCC(ret)) {
             if (!(ObNullType == col->get_cur_default_value().get_type() && !col->is_nullable())

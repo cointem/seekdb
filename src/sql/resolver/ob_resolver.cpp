@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "share/schema/ai_column_schema.h"
+#include "sql/parser/ob_parser.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -139,6 +141,116 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
 
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
+  if (parse_tree.type_ == T_SHOW_COLUMNS && parse_tree.children_[0] != nullptr
+      && parse_tree.children_[0]->type_ == T_AI_COLUMN) {
+    using namespace share::schema;
+    int ret = OB_SUCCESS;
+    const ParseNode *relation = parse_tree.children_[1];
+    ObString database = params_.session_info_->get_database_name();
+    if (relation->children_[0] != nullptr) {
+      database.assign_ptr(relation->children_[0]->str_value_, relation->children_[0]->str_len_);
+    }
+    ObString name(relation->children_[1]->str_len_, relation->children_[1]->str_value_);
+    const ObTableSchema *table = nullptr;
+    if (OB_FAIL(params_.schema_checker_->get_table_schema(database, name, false, table))) { return ret; }
+    if (table == nullptr) { return OB_TABLE_NOT_EXIST; }
+    std::string query = "SELECT column_name AS Field,normalized_expr AS Expression,"
+        "JSON_EXTRACT(definition,'$.dependencies') AS Dependencies,'async' AS Sync_mode,"
+        "max_retries AS Max_retries,definition_version AS Definition_version "
+        "FROM oceanbase.__all_ai_column WHERE table_id=" + std::to_string(table->get_table_id())
+        + " ORDER BY column_id";
+    ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode());
+    ParseResult parsed;
+    if (OB_FAIL(parser.parse(ObString(query.size(), query.data()), parsed))) { return ret; }
+    return resolve(if_prepared, *parsed.result_tree_->children_[0], stmt);
+  }
+  // RETRY is a transactional UPDATE of one hidden generation marker. Reusing
+  // the ordinary DML executor gives it row locking, rollback and vector-index
+  // maintenance identical to an update of an AI dependency.
+  if (parse_tree.type_ == T_ALTER_TABLE && parse_tree.children_[1] != nullptr) {
+    const ParseNode *actions = parse_tree.children_[1];
+    const ParseNode *retry = nullptr;
+    for (int64_t i = 0; i < actions->num_child_; ++i) {
+      if (actions->children_[i]->type_ == T_AI_COLUMN_RETRY) { retry = actions->children_[i]; }
+    }
+    if (retry != nullptr) {
+      using namespace share::schema;
+      int ret = OB_SUCCESS;
+      const ParseNode *relation = parse_tree.children_[0];
+      const ObTableSchema *table = nullptr;
+      ObString database = params_.session_info_->get_database_name();
+      if (relation->children_[0] != nullptr) {
+        database.assign_ptr(relation->children_[0]->str_value_, relation->children_[0]->str_len_);
+      }
+      ObString table_name(relation->children_[1]->str_len_, relation->children_[1]->str_value_);
+      ObString column_name(retry->children_[0]->str_len_, retry->children_[0]->str_value_);
+      if (actions->num_child_ != 1) { ret = OB_NOT_SUPPORTED; }
+      else if (OB_FAIL(params_.schema_checker_->get_table_schema(database, table_name, false, table))) {
+      } else if (table == nullptr) { ret = OB_TABLE_NOT_EXIST; }
+      AiColumnDefinition definition;
+      if (OB_SUCC(ret)) {
+        const auto *column = table->get_column_schema(column_name);
+        if (column == nullptr || (column->get_column_flags() & AI_COLUMN_FLAG) == 0) { ret = OB_NOT_SUPPORTED; }
+        else { definition.name = AiColumnDefinition::string(column->get_column_name_str()); }
+      }
+      if (OB_FAIL(ret)) {
+        if (ret == OB_NOT_SUPPORTED) {
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, actions->num_child_ != 1
+              ? "combining AI COLUMN RETRY with another ALTER action"
+              : "retrying a column that is not an AI column");
+        }
+        return ret;
+      }
+      std::string state = AiColumnDefinition::identifier(definition.hidden("state"));
+      std::string status = "(CASE " + state + " WHEN 0 THEN 'PENDING' WHEN 1 THEN 'READY' ELSE 'FAILED' END)";
+      std::string predicate;
+      const ParseNode *where = retry->children_[1];
+      if (where != nullptr) {
+        std::string source(where->str_value_, where->str_len_);
+        // Preserve quoted identifiers, literals and comments. Only an unquoted
+        // standalone status identifier denotes the AI state pseudo-column.
+        for (size_t i = 0; i < source.size();) {
+          size_t begin = i;
+          char c = source[i];
+          if (c == '\'' || c == '"' || c == '`') {
+            ++i;
+            while (i < source.size()) {
+              if (source[i] == '\\' && c != '`' && !(params_.session_info_->get_sql_mode() & SMO_NO_BACKSLASH_ESCAPES)) {
+                i = std::min(i + 2, source.size());
+              } else if (source[i++] == c) {
+                if (i < source.size() && source[i] == c) { ++i; }
+                else { break; }
+              }
+            }
+          } else if (c == '/' && i + 1 < source.size() && source[i + 1] == '*') {
+            size_t end = source.find("*/", i + 2); i = end == std::string::npos ? source.size() : end + 2;
+          } else if (c == '#' || (c == '-' && i + 2 < source.size() && source[i + 1] == '-' && isspace(source[i + 2]))) {
+            size_t end = source.find('\n', i); i = end == std::string::npos ? source.size() : end + 1;
+          } else if (isalpha(static_cast<unsigned char>(c)) || c == '_' || static_cast<unsigned char>(c) >= 128) {
+            do { ++i; } while (i < source.size() && (isalnum(static_cast<unsigned char>(source[i]))
+                || source[i] == '_' || source[i] == '$' || static_cast<unsigned char>(source[i]) >= 128));
+            if (i - begin == 6 && strncasecmp(source.data() + begin, "status", 6) == 0
+                && (begin == 0 || source[begin - 1] != '.') && (i == source.size() || source[i] != '.')) {
+              predicate += status; continue;
+            }
+          } else { ++i; }
+          predicate.append(source, begin, i - begin);
+        }
+      }
+      std::string update = "UPDATE " + AiColumnDefinition::identifier(AiColumnDefinition::string(database))
+          + "." + AiColumnDefinition::identifier(AiColumnDefinition::string(table_name))
+          + " SET " + state + "=-1";
+      if (!predicate.empty()) { update += " WHERE " + predicate; }
+      ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode());
+      ParseResult parsed;
+      if (OB_FAIL(parser.parse(ObString(update.size(), update.data()), parsed))) { return ret; }
+      bool saved = params_.session_info_->is_ai_column_internal();
+      params_.session_info_->set_ai_column_internal(true);
+      ret = resolve(if_prepared, *parsed.result_tree_->children_[0], stmt);
+      params_.session_info_->set_ai_column_internal(saved);
+      return ret;
+    }
+  }
 #define REGISTER_STMT_RESOLVER(name)                                   \
   do {                                                                 \
     ret = stmt_resolver_func<Ob##name##Resolver>(params_, *real_parse_tree, stmt); \

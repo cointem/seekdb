@@ -29,6 +29,7 @@
 #include <thread>
 #include <cstdio>
 #include "observer/ob_server.h"
+#include "observer/ai_service/ai_column_worker.h"
 #include "observer/ob_system_package_load_service.h"
 #include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_autoincrement_service.h"
@@ -902,6 +903,8 @@ int ObServer::init(const ObServerOptions &opts, const ObPLogWriterCfg &log_cfg)
 
 void ObServer::destroy()
 {
+  AiColumnWorker::instance().stop();
+  AiColumnWorker::instance().wait();
   // observer.destroy() be called under two scenarios:
   // 1. main() exit
   // 2. ObServer destruction.
@@ -1335,6 +1338,9 @@ int ObServer::start()
       LOG_ERROR("fail to start standby gRPC service", KR(ret));
     }
 
+  if (OB_SUCC(ret) && OB_FAIL(AiColumnWorker::instance().start())) {
+    LOG_ERROR("failed to start AI column worker", K(ret));
+  }
   int64_t start_service_time = ObTimeUtility::current_time();
   if (OB_FAIL(ret)) {
     LOG_ERROR("failure occurs, stop observer startup", KR(ret));
@@ -1526,6 +1532,7 @@ bool ObServer::is_stopped()
 
 void ObServer::set_stop()
 {
+  AiColumnWorker::instance().stop();
   net_frame_.sql_nio_stop();
   stop_ = true;
   ob_service_.set_stop();

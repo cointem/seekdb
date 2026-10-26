@@ -73,6 +73,7 @@ public:
 
   virtual void destroy();
   virtual void reset();
+  common::ObSEArray<common::ObString, 4> ai_column_checks_;
   void set_is_last_exec_succ(bool val) { stat_.is_last_exec_succ_ = val; }
   bool is_last_exec_succ() const { return stat_.is_last_exec_succ_; }
   const ObString &get_constructed_sql() const { return stat_.constructed_sql_; }

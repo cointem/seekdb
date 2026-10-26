@@ -129,7 +129,11 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
         ObRawExpr *expr = value_list.at(i);
         bool is_generated_column = true;
         // Mysql only allows updating generated columns to their default value
-        if (OB_FAIL(check_basic_column_generated(ref_expr, stmt, is_generated_column))) {
+        if (!session_info_->is_ai_column_internal()
+            && (ref_expr->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
+        } else if (OB_FAIL(check_basic_column_generated(ref_expr, stmt, is_generated_column))) {
         } else {
           if (T_DEFAULT == expr->get_expr_type()) {
             ObDefaultValueUtils utils(stmt, &params_, this);
@@ -2340,6 +2344,10 @@ int ObDelUpdResolver::resolve_insert_values(const ParseNode *node,
                 }
               } else if (OB_FAIL(utils.resolve_default_expr(*column_item, expr, T_INSERT_SCOPE))) {
               }
+            } else if (!session_info_->is_ai_column_internal()
+                && (column_expr->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
             } else if (OB_FAIL(check_basic_column_generated(column_expr, del_upd_stmt,
                                                             is_generated_column))) {
             } else if (is_generated_column) {

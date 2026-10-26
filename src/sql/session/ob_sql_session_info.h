@@ -611,6 +611,11 @@ public:
     inner_flag_ = true;
     session_type_ = INNER_SESSION;
   }
+  bool is_ai_column_internal() const { return ai_column_internal_; }
+  void set_ai_column_internal(bool value) { ai_column_internal_ = value; }
+private:
+  bool ai_column_internal_ = false;
+public:
   inline void set_user_session()
   {
     inner_flag_ = false;

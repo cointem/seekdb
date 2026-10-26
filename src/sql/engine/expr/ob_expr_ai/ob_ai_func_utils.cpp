@@ -1336,6 +1336,16 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   ObAIFuncClient client;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
+  if (config != nullptr) {
+    ObJsonNode *system = config->get_value("system_prompt");
+    if (system != nullptr) {
+      if (system->json_type() != ObJsonNodeType::J_STRING) {
+        return OB_INVALID_ARGUMENT;
+      }
+      prompt_str = static_cast<ObJsonString *>(system)->get_str();
+      if (OB_FAIL(config->remove("system_prompt"))) { return ret; }
+    }
+  }
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");

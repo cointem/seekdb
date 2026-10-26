@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
+#include "share/schema/ai_column_schema.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
@@ -3457,6 +3458,27 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          }
+          if (OB_SUCC(ret) && !stat.ai_definition_.empty()) {
+            AiColumnDefinition definition;
+            if (OB_FAIL(definition.load(stat.ai_definition_))) {
+            } else {
+              for (const auto &name : definition.dependencies) {
+                const ObColumnSchemaV2 *dep = table_schema_->get_column_schema(name.c_str());
+                if (dep == nullptr || dep->is_hidden() || (dep->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+                  ret = OB_NOT_SUPPORTED;
+                  LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column dependency on an AI, hidden or missing column");
+                  break;
+                }
+              }
+              for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+                AlterColumnSchema hidden;
+                hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+                if (OB_FAIL(definition.make_hidden(alter_column_schema, k, hidden))) {
+                } else if (OB_FAIL(alter_table_stmt->add_column(hidden))) {
+                }
+              }
+            }
           }
         }
       }

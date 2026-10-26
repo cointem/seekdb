@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
+#include "share/schema/ai_column_schema.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -633,6 +634,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     // Store the column schema after resolve_column_definition in resolved_cols
     // To support generating columns in any order, all column_schema are generated first and then uniformly stored in table_schema
     ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> resolved_cols;
+    ObSEArray<ObColumnSchemaV2, 6> ai_hidden_cols;
     // Resolve column names with the runtime name-case mode.
     //RESOLVE_NON_COL needs to add the columns in the query to stats in order to resolve PK constraint information etc.
     if (OB_FAIL(ret)) {
@@ -834,6 +836,21 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             }
           }
 
+          if (OB_SUCC(ret) && !stat.ai_definition_.empty()) {
+            AiColumnDefinition definition;
+            if (OB_FAIL(definition.load(stat.ai_definition_))) {
+            } else {
+              for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+                ObColumnSchemaV2 hidden;
+                if (OB_FAIL(definition.make_hidden(column, k, hidden))) {
+                } else {
+                  hidden.set_column_id(gen_column_id());
+                  ret = ai_hidden_cols.push_back(hidden);
+                }
+              }
+            }
+          }
+
           if (OB_SUCC(ret) && !column.is_invisible_column()) {
             has_visible_col = true;
           }
@@ -891,6 +908,28 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         } else {
           ObColumnNameHashWrapper name_key(hidden_col.get_column_name_str());
           if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+          }
+        }
+      }
+    }
+
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_hidden_cols.count(); ++i) {
+      ret = table_schema.add_column(ai_hidden_cols.at(i));
+    }
+
+    // Resolve dependencies after all user columns, including forward references.
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
+      const ObColumnSchemaV2 *spec = table_schema.get_column_schema_by_idx(i);
+      if ((spec->get_column_flags() & AI_RESULT_SPEC_COLUMN_FLAG) != 0) {
+        AiColumnDefinition definition;
+        if (OB_FAIL(definition.load(spec->get_cur_default_value().get_string()))) {
+        } else {
+          for (const auto &name : definition.dependencies) {
+            const ObColumnSchemaV2 *dep = table_schema.get_column_schema(name.c_str());
+            if (dep == nullptr || dep->is_hidden() || (dep->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+              ret = OB_NOT_SUPPORTED;
+              break;
+            }
           }
         }
       }

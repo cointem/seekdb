@@ -1836,6 +1836,8 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
                                              ObDMLStmt *stmt /* = NULL */)
 {
   int ret = OB_SUCCESS;
+  include_hidden = include_hidden || (session_info_ != nullptr &&
+      (session_info_->is_ai_column_internal() || !session_info_->is_user_session()));
   ObColumnRefRawExpr *col_expr = NULL;
   ObSchemaGetterGuard *schema_guard = NULL;
   ColumnItem column_item;
@@ -11501,6 +11503,11 @@ int ObDMLResolver::resolve_values_table_for_insert(const ParseNode &table_node,
             } else if (OB_FAIL(resolve_sql_expr(*value_node, expr))) {
             } else if (OB_ISNULL(expr) || OB_ISNULL(table_info.values_desc_.at(j))) {
               ret = OB_ERR_UNEXPECTED;
+            } else if (!session_info_->is_ai_column_internal()
+                && (table_info.values_desc_.at(j)->get_column_flags() & AI_COLUMN_FLAG) != 0
+                && expr->get_expr_type() != T_DEFAULT) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
             } else if (table_info.values_desc_.at(j)->is_generated_column() &&
                        expr->get_expr_type() != T_DEFAULT) {
               ret = OB_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN;

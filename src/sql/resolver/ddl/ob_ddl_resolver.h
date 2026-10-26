@@ -75,6 +75,7 @@ struct ObColumnResolveStat
     is_set_null_ = false;
     is_set_not_null_ = false;
     is_set_default_value_ = false;
+    ai_definition_.reset();
   }
   int64_t to_string(char *buf, const int64_t buf_len) const
   {
@@ -97,6 +98,7 @@ struct ObColumnResolveStat
   bool is_set_not_null_;
   bool is_set_default_value_;
   bool is_unique_key_;
+  common::ObString ai_definition_;
 };
 
 struct ObDefaultValueRes

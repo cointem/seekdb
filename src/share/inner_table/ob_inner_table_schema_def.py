@@ -2467,6 +2467,39 @@ all_objauth_mysql_def = dict(
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
 
+def_table_schema(
+    owner='cointem', table_name='__all_ai_column', table_id='1135', table_type='SYSTEM_TABLE',
+    gm_columns=['gmt_create', 'gmt_modified'],
+    is_cluster_private=False, meta_record_in_sys=False,
+    rowkey_columns=[('table_id', 'int'), ('column_id', 'int')],
+    normal_columns=[
+        ('column_name', 'varchar:128', 'false'),
+        ('state_column_id', 'int', 'false'),
+        ('request_column_id', 'int', 'false'),
+        ('result_spec_column_id', 'int', 'false'),
+        ('normalized_expr', 'longtext', 'false'),
+        ('definition', 'longtext', 'false'),
+        ('max_retries', 'int', 'false'),
+        ('definition_version', 'int', 'false')])
+
+def_table_schema(
+    owner='cointem', table_name='__all_ai_column_task', table_id='1136', table_type='SYSTEM_TABLE',
+    gm_columns=['gmt_create', 'gmt_modified'],
+    is_cluster_private=False, meta_record_in_sys=False,
+    rowkey_columns=[('table_id', 'int'), ('request_id', 'varchar:64'), ('column_id', 'int')],
+    normal_columns=[
+        ('rowkey_predicate', 'varchar:8192', 'false'),
+        ('definition_version', 'int', 'false'),
+        ('definition', 'longtext', 'false'),
+        ('prompt', 'longtext', 'true'),
+        ('state', 'int', 'false', 0),
+        ('retry_count', 'int', 'false', 0),
+        ('eligible_ts', 'timestamp', 'false'),
+        ('lease_expiry', 'timestamp', 'true'),
+        ('lease_owner', 'varchar:64', 'true'),
+        ('result', 'longtext', 'true'),
+        ('last_error', 'int', 'false', 0)])
+
 
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use actual table names for placeholders

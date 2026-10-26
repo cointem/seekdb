@@ -499,6 +499,10 @@ _SQL_RUNTIME_EXTRA_DEP_CONSUMERS = {
         'ob_sql_session_0',
     ],
     '//src/share:schema_persistence': [
+        'ob_sql_code_generator_0',
+        'ob_sql_engine_dml_0',
+        'ob_sql_printer_0',
+        'ob_sql_resolver_0',
         'ob_sql_resolver_ddl_0',
         'ob_sql_resolver_ddl_1',
     ],

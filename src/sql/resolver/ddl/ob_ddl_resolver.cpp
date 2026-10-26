@@ -32,6 +32,8 @@
 #include "share/rc/ob_server_runtime.h"
 #include "share/schema/ob_table_schema.h"
 #include "sql/engine/expr/ob_obj_cast_runtime.h"
+#include "share/schema/ai_column_schema.h"
+#include <functional>
 
 namespace oceanbase
 {
@@ -41,6 +43,103 @@ using namespace share;
 using namespace obcall;
 namespace sql
 {
+static int resolve_ai_definition(ObColumnSchemaV2 &column, const ParseNode &node,
+                                 ObIAllocator &allocator, ObString &definition)
+{
+  int ret = OB_SUCCESS;
+  AiColumnDefinition def;
+  def.result_type = column.get_data_type();
+  def.name = AiColumnDefinition::string(column.get_column_name_str());
+  const ParseNode *function = node.children_[0];
+  const ParseNode *model = node.children_[1];
+  const ParseNode *prompt = node.children_[2];
+  const ParseNode *argument = node.children_[3];
+  const ParseNode *options = node.children_[4];
+  ObString function_name(function->str_len_, function->str_value_);
+  def.embedding = function_name.case_compare("ai_embed") == 0;
+  if ((!def.embedding && function_name.case_compare("ai_complete") != 0)
+      || (model->type_ != T_VARCHAR && model->type_ != T_CHAR) || model->str_len_ == 0) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    def.model.assign(model->str_value_, model->str_len_);
+    def.prompt.assign(prompt->str_value_, prompt->str_len_);
+    if (argument != nullptr) { def.argument.assign(argument->str_value_, argument->str_len_); }
+    if (def.embedding) {
+      if (!column.is_collection()) { ret = OB_NOT_SUPPORTED; }
+      else if (OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(column.get_extended_type_info(), def.dimension))) {
+      } else if (argument != nullptr && (argument->type_ != T_INT || argument->value_ != def.dimension)) {
+        ret = OB_ERR_INVALID_VECTOR_DIM;
+        LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM, static_cast<unsigned>(def.dimension),
+            static_cast<unsigned>(argument->value_));
+      }
+    } else if (column.is_collection() || column.is_geometry() || column.is_enum_or_set()) {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+  bool saw_mode = false, saw_retries = false;
+  for (int64_t i = 0; OB_SUCC(ret) && options != nullptr && i < options->num_child_; ++i) {
+    const ParseNode *option = options->children_[i];
+    if (option->type_ != T_OP_EQ || option->num_child_ != 2
+        || option->children_[0]->type_ != T_COLUMN_REF
+        || option->children_[0]->children_[0] != nullptr
+        || option->children_[0]->children_[1] != nullptr) { ret = OB_NOT_SUPPORTED; }
+    else {
+      const ParseNode *key = option->children_[0]->children_[2];
+      const ParseNode *value = option->children_[1];
+      ObString key_name(key->str_len_, key->str_value_);
+      if (key_name.case_compare("sync_mode") == 0 && !saw_mode) {
+        saw_mode = true;
+        if (value->type_ != T_VARCHAR || ObString(value->str_len_, value->str_value_).case_compare("async") != 0) {
+          ret = OB_NOT_SUPPORTED;
+        }
+      } else if (key_name.case_compare("max_retries") == 0 && !saw_retries) {
+        saw_retries = true;
+        if (value->type_ != T_INT || value->value_ < 0 || value->value_ > 100) { ret = OB_INVALID_ARGUMENT; }
+        else { def.retries = value->value_; }
+      } else { ret = OB_NOT_SUPPORTED; }
+    }
+  }
+  std::function<void(const ParseNode *, int)> collect = [&](const ParseNode *n, int depth) {
+    if (n == nullptr || OB_FAIL(ret)) { return; }
+    if (depth > 64 || n->type_ == T_SELECT || n->type_ == T_REF_QUERY || n->type_ == T_QUESTIONMARK
+        || n->type_ == T_SYSTEM_VARIABLE || n->type_ == T_USER_VARIABLE_IDENTIFIER) { ret = OB_NOT_SUPPORTED; }
+    else if (n->type_ == T_COLUMN_REF) {
+      if (n->children_[0] != nullptr || n->children_[1] != nullptr) { ret = OB_NOT_SUPPORTED; }
+      else {
+        auto *name = n->children_[2];
+        std::string value(name->str_value_, name->str_len_);
+        if (std::find(def.dependencies.begin(), def.dependencies.end(), value) == def.dependencies.end()) {
+          def.dependencies.push_back(value);
+        }
+      }
+    } else {
+      if (n->type_ == T_FUN_SYS && n->children_[0] != nullptr) {
+        auto *name = n->children_[0];
+        ObString f(name->str_len_, name->str_value_);
+        if (f.case_compare("ai_complete") == 0 || f.case_compare("ai_embed") == 0
+            || f.case_compare("ai_rerank") == 0) { ret = OB_NOT_SUPPORTED; }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < n->num_child_; ++i) { collect(n->children_[i], depth + 1); }
+    }
+  };
+  collect(prompt, 0);
+  if (argument != nullptr && !def.embedding && argument->type_ != T_NULL
+      && argument->type_ != T_VARCHAR && argument->type_ != T_CHAR) { ret = OB_NOT_SUPPORTED; }
+  if (OB_SUCC(ret)) {
+    def.normalized_expr = std::string(def.embedding ? "AI_EMBED(" : "AI_COMPLETE(")
+        + AiColumnDefinition::literal(def.model) + "," + def.prompt;
+    if (def.embedding) { def.normalized_expr += "," + std::to_string(def.dimension); }
+    else { def.normalized_expr += "," + def.completion_config(); }
+    def.normalized_expr += ")";
+    std::string json = def.json();
+    if (json.size() > 16384) { ret = OB_SIZE_OVERFLOW; }
+    else if (OB_FAIL(ob_write_string(allocator, ObString(json.size(), json.data()), definition))) {
+    } else { column.add_column_flag(AI_COLUMN_FLAG); column.set_nullable(true); }
+  }
+  if (ret == OB_NOT_SUPPORTED) { LOG_USER_ERROR(OB_NOT_SUPPORTED, "this AI column definition"); }
+  return ret;
+}
+
 ObDDLResolver::ObDDLResolver(ObResolverParams &params)
   : ObStmtResolver(params),
     block_size_(OB_DEFAULT_SSTABLE_BLOCK_SIZE),
@@ -2084,6 +2183,10 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
     for (int64_t i = 0; OB_SUCC(ret) && i < attrs_node->num_child_; ++i) {
       ParseNode *attr_node = attrs_node->children_[i];
       switch (attr_node->type_) {
+      case T_AI_COLUMN: {
+        ret = resolve_ai_definition(column, *attr_node, *allocator_, resolve_stat.ai_definition_);
+        break;
+      }
       case T_CONSTR_NOT_NULL: {
         if (OB_FAIL(resolve_normal_column_attribute_constr_not_null(column, attr_node, resolve_stat))) {
         }

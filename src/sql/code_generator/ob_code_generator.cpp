@@ -20,6 +20,9 @@
 #include "sql/code_generator/ob_code_generator.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/engine/ob_physical_plan.h"
+#include "share/schema/ai_column_schema.h"
+#include <functional>
+#include <set>
 
 namespace oceanbase
 {
@@ -39,6 +42,53 @@ int ObCodeGenerator::generate(const ObLogPlan &log_plan,
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(generate_exprs(log_plan, phy_plan))) {
   } else if (OB_FAIL(generate_operators(log_plan, phy_plan))) {
+  }
+
+  // Keep column-level checks outside row filters and before the first write.
+  // In particular, filtering to READY rows must not bypass strict-read mode.
+  if (OB_SUCC(ret)) {
+    std::set<std::string> checks;
+    auto &guard = *log_plan.get_optimizer_context().get_exec_ctx()->get_sql_ctx()->schema_guard_;
+    std::function<void(const ObDMLStmt *)> collect = [&](const ObDMLStmt *stmt) {
+      using namespace share::schema;
+      if (stmt == nullptr || OB_FAIL(ret)) { return; }
+      for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_items().count(); ++i) {
+        const auto &item = stmt->get_column_items().at(i);
+        if (item.expr_ == nullptr || !item.expr_->is_referred_by_normal()
+            || (item.expr_->get_column_flags() & AI_COLUMN_FLAG) == 0) { continue; }
+        const auto *table_item = stmt->get_table_item_by_id(item.table_id_);
+        if (table_item == nullptr || !table_item->is_basic_table()) { continue; }
+        const ObTableSchema *table = nullptr;
+        const ObDatabaseSchema *database = nullptr;
+        if (OB_FAIL(guard.get_table_schema(table_item->ref_id_, table))) {
+        } else if (table == nullptr) { ret = OB_SCHEMA_ERROR; }
+        else if (OB_FAIL(guard.get_database_schema(table->get_database_id(), database))) {
+        } else if (database == nullptr) { ret = OB_SCHEMA_ERROR; }
+        else {
+          AiColumnDefinition def;
+          def.name = AiColumnDefinition::string(item.expr_->get_column_name());
+          std::string query = "SELECT " + std::to_string(table->get_table_id()) + ","
+              + std::to_string(item.column_id_) + " FROM "
+              + AiColumnDefinition::identifier(AiColumnDefinition::string(database->get_database_name_str()))
+              + "." + AiColumnDefinition::identifier(AiColumnDefinition::string(table->get_table_name_str()))
+              + " WHERE " + AiColumnDefinition::identifier(def.hidden("state")) + " <> 1 LIMIT 1";
+          checks.insert(query);
+        }
+      }
+      ObSEArray<ObSelectStmt *, 4> children;
+      if (OB_SUCC(ret) && OB_FAIL(stmt->get_child_stmts(children))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < children.count(); ++i) { collect(children.at(i)); }
+      }
+    };
+    collect(log_plan.get_stmt());
+    for (const auto &check : checks) {
+      if (OB_FAIL(ret)) { break; }
+      ObString saved;
+      if (OB_FAIL(ob_write_string(phy_plan.get_allocator(), ObString(check.size(), check.data()), saved))) {
+      } else if (OB_FAIL(phy_plan.ai_column_checks_.push_back(saved))) {
+      }
+    }
   }
 
   return ret;

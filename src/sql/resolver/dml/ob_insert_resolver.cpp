@@ -834,6 +834,10 @@ int ObInsertResolver::check_insert_select_field(ObInsertStmt &insert_stmt,
     const ObColumnRefRawExpr *value_desc = values_desc.at(i);
     if (OB_ISNULL(value_desc)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (!session_info_->is_ai_column_internal()
+        && (value_desc->get_column_flags() & AI_COLUMN_FLAG) != 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
     } else if (OB_FAIL(ObDMLResolver::check_basic_column_generated(value_desc,
                                                                    &insert_stmt,
                                                                    is_generated_column))) {

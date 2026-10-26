@@ -597,6 +597,7 @@ _SHARE_SEMANTIC_HEADER_TARGETS = {
             "schema/ob_routine_sql_service.h",
             "schema/ob_sys_variable_sql_service.h",
             "schema/ob_table_sql_service.h",
+            "schema/ai_column_schema.h",
             "schema/ob_trigger_sql_service.h",
             "schema/ob_user_sql_service.h",
         ],

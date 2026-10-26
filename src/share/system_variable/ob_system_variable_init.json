@@ -10974,6 +10974,19 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Reject statements that reference AI columns with pending or failed rows",
+    "flags": "SESSION | INFLUENCE_PLAN",
+    "publish_version": "1.0.0.0",
+    "info_cn": "拒绝读取尚未就绪的 AI 列",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_sparse_drop_ratio_search": {
     "id": 10753,
     "name": "ob_sparse_drop_ratio_search",

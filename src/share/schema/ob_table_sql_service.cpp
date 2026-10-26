@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
+#include "share/schema/ai_column_schema.h"
 #include "ob_table_sql_service.h"
 #include "lib/literals/ob_literals.h"
 #include "share/ob_global_stat_proxy.h"
@@ -689,6 +690,19 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
   }
   // delete from __all_table and __all_column
   if (OB_SUCC(ret)) {
+    bool has_ai = false;
+    for (int64_t i = 0; i < table_schema.get_column_count(); ++i) {
+      has_ai |= (table_schema.get_column_schema_by_idx(i)->get_column_flags() & AI_COLUMN_FLAG) != 0;
+    }
+    if (has_ai) {
+      int64_t affected = 0;
+      std::string key = " WHERE table_id=" + std::to_string(table_id);
+      if (OB_FAIL(sql_client.write(("DELETE FROM oceanbase.__all_ai_column_task" + key).c_str(), affected))) {
+      } else if (OB_FAIL(sql_client.write(("DELETE FROM oceanbase.__all_ai_column" + key).c_str(), affected))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
     if (OB_FAIL(delete_from_all_table(sql_client, table_id))) {
     } else if (OB_FAIL(delete_from_all_column(
                        sql_client, table_id,
@@ -888,6 +902,7 @@ int ObTableSqlService::insert_single_column(
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
   } else if (OB_FAIL(add_single_column(sql_client, new_column_schema))) {
+  } else if (OB_FAIL(persist_ai_column(sql_client, new_table_schema.get_table_id(), new_column_schema))) {
   }
   if (OB_SUCC(ret)) {
     if (new_column_schema.is_autoincrement()) {
@@ -2163,6 +2178,10 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
       for (int64_t i = 0; i < tables.count() && OB_SUCC(ret); i++) {
         if (is_inner_table(tables.at(i).get_table_id())) {
         } else if (OB_FAIL(add_foreign_key(sql_client, tables.at(i), false/*only_history*/))) {
+        }
+        for (int64_t c = 0; OB_SUCC(ret) && c < tables.at(i).get_column_count(); ++c) {
+          ret = persist_ai_column(sql_client, tables.at(i).get_table_id(), *tables.at(i).get_column_schema_by_idx(c));
+          if (OB_FAIL(ret)) { LOG_ERROR("AI metadata persistence failed", K(ret), K(i), K(c)); }
         }
       }
       time_guard.click("add_foreign_key");

@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_table_modify_op.h"
+#include "sql/engine/dml/ai_column_runtime.h"
 #include "share/ob_autoincrement_service.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
@@ -942,6 +943,12 @@ int ObTableModifyOp::open_inner_conn()
     }
   }
   return ret;
+}
+
+bool ObTableModifyOp::need_after_row_process(const ObDMLBaseCtDef &definition)
+{
+  return need_foreign_key_check(definition) || has_after_row_trigger(definition)
+      || AiColumnRuntime::needs_after_row(*this, definition);
 }
 
 int ObTableModifyOp::close_inner_conn()
