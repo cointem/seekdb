@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_text_daat_iter.h"
+#include <cmath>
+#include <limits>
 
 namespace oceanbase
 {
@@ -175,7 +177,7 @@ int ObTextDaaTIter::pre_process()
 
 ObTextBMWIter::ObTextBMWIter()
   : ObSRBMWIterImpl(),
-    bm25_param_estimator_() {}
+    bm25_param_estimator_(), dense_top_k_enabled_(false) {}
 
 void ObTextBMWIter::reuse(const bool switch_tablet)
 {
@@ -190,6 +192,7 @@ void ObTextBMWIter::reuse(const bool switch_tablet)
 
 void ObTextBMWIter::reset()
 {
+  dense_top_k_enabled_ = false;
   bm25_param_estimator_.reset();
   if (OB_NOT_NULL(dim_iters_)) {
     for (int64_t i = 0; i < dim_iters_->count(); ++i) {
@@ -208,6 +211,15 @@ int ObTextBMWIter::init(const ObTextDaaTParam &param)
   } else if (OB_FAIL(ObSRBMWIterImpl::init(*param.base_param_, *param.dim_iters_,
                                            *param.allocator_, *param.relevance_collector_))) {
   } else if (OB_FAIL(bm25_param_estimator_.init(param.bm25_param_est_ctx_))) {
+  } else {
+    const ObExpr *filter = iter_param_->filter_expr_;
+    const ObExpr *hit = iter_param_->relevance_proj_expr_;
+    const bool hit_filter = nullptr == filter || filter == hit
+        || (T_OP_BOOL == filter->type_ && filter->arg_cnt_ == 1 && filter->args_[0] == hit);
+    dense_top_k_enabled_ = sql::NATURAL_LANGUAGE_MODE == param.mode_flag_
+        && !param.function_lookup_mode_ && nullptr == iter_param_->dim_weights_
+        && iter_param_->field_boost_ == 1.0 && dim_iters_->count() > 1
+        && dim_iters_->count() <= 8 && hit_filter;
   }
   return ret;
 }
@@ -240,6 +252,133 @@ int ObTextBMWIter::init_before_wand_process()
     ObTextRetrievalBlockMaxIter *block_max_iter = static_cast<ObTextRetrievalBlockMaxIter *>(dim_iters_->at(i));
     if (OB_FAIL(block_max_iter->init_block_max_iter(
         bm25_param_estimator_.get_total_doc_cnt(), bm25_param_estimator_.get_avg_doc_token_cnt()))) {
+    }
+  }
+  return ret;
+}
+
+int ObTextBMWIter::try_dense_top_k_search(bool &handled)
+{
+  int ret = OB_SUCCESS;
+  handled = false;
+  if (!dense_top_k_enabled_) {
+    return ret;
+  }
+  // MAXSCORE partitions terms by their cumulative upper bounds. Only essential
+  // terms generate candidates; the others are sought and scored on demand.
+  // Small term sets can do this directly, without rebuilding a merge heap for
+  // every candidate. Posting decoding and BM25 evaluation remain batched below.
+  const int64_t dim_count = dim_iters_->count();
+  int64_t order[8];
+  double bounds[8];
+  double prefix[8];
+  const ObDatum *ids[8] = {};
+  ObTextRetrievalBlockMaxIter *iters[8];
+  for (int64_t i = 0; OB_SUCC(ret) && i < dim_count; ++i) {
+    order[i] = i;
+    iters[i] = static_cast<ObTextRetrievalBlockMaxIter *>(dim_iters_->at(i));
+    if (OB_FAIL(iters[i]->get_dim_max_score(bounds[i]))) {
+    } else if (!std::isfinite(bounds[i]) || bounds[i] < 0.0) {
+      // MAXSCORE requires nonnegative finite upper bounds. Keep BMW otherwise.
+      return OB_SUCCESS;
+    }
+  }
+  for (int64_t i = 1; OB_SUCC(ret) && i < dim_count; ++i) {
+    const int64_t idx = order[i];
+    int64_t j = i;
+    while (j > 0 && bounds[order[j - 1]] > bounds[idx]) {
+      order[j] = order[j - 1];
+      --j;
+    }
+    order[j] = idx;
+  }
+  double sum = 0.0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < dim_count; ++i) {
+    sum = std::nextafter(sum + bounds[order[i]], std::numeric_limits<double>::infinity());
+    prefix[i] = sum;
+  }
+  // Transfer only live iterators. Exhausted dimensions have no current row.
+  while (OB_SUCC(ret) && !merge_heap_->empty()) {
+    const ObSRMergeItem *item = nullptr;
+    if (OB_FAIL(merge_heap_->top(item))) {
+    } else if (OB_FAIL(iters[item->iter_idx_]->get_curr_id(ids[item->iter_idx_]))) {
+    } else if (OB_FAIL(merge_heap_->pop())) {
+    }
+  }
+  handled = OB_SUCC(ret);
+  LOG_DEBUG("switch text retrieval from BMW to MAXSCORE", K(ret), K(dim_count), K(top_k_count_));
+  int64_t essential_begin = 0;
+  // Retain a conservative margin for differences in floating point sum order.
+  const double margin = 16 * std::numeric_limits<double>::epsilon() * std::max(1.0, sum);
+  while (OB_SUCC(ret)) {
+    const double threshold = get_top_k_threshold();
+    while (essential_begin < dim_count && prefix[essential_begin] + margin < threshold) {
+      ++essential_begin;
+    }
+    const ObDatum *candidate = nullptr;
+    uint64_t winners = 0;
+    for (int64_t j = essential_begin; OB_SUCC(ret) && j < dim_count; ++j) {
+      const int64_t i = order[j];
+      int cmp = 0;
+      if (nullptr == ids[i]) {
+      } else if (nullptr == candidate) {
+        candidate = ids[i];
+        winners = 1ULL << i;
+      } else if (OB_FAIL(domain_id_cmp_.compare(*ids[i], *candidate, cmp))) {
+      } else if (cmp < 0) {
+        candidate = ids[i];
+        winners = 1ULL << i;
+      } else if (cmp == 0) {
+        winners |= 1ULL << i;
+      }
+    }
+    if (OB_FAIL(ret) || nullptr == candidate) {
+      break;
+    }
+    double score = 0.0;
+    for (uint64_t pending = winners; OB_SUCC(ret) && pending != 0; pending &= pending - 1) {
+      double term_score = 0.0;
+      if (OB_FAIL(iters[__builtin_ctzll(pending)]->get_curr_score(term_score))) {
+      } else {
+        score += term_score;
+      }
+    }
+    bool competitive = true;
+    for (int64_t j = essential_begin - 1; OB_SUCC(ret) && competitive && j >= 0; --j) {
+      const int64_t i = order[j];
+      int cmp = 0;
+      if (score + prefix[j] + margin < threshold) {
+        competitive = false;
+      } else if (nullptr == ids[i]) {
+      } else if (OB_FAIL(iters[i]->advance_to(*candidate))) {
+        if (OB_ITER_END == ret) {
+          ids[i] = nullptr;
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(iters[i]->get_curr_id(ids[i]))) {
+      } else if (OB_FAIL(domain_id_cmp_.compare(*ids[i], *candidate, cmp))) {
+      } else if (cmp == 0) {
+        double term_score = 0.0;
+        if (OB_FAIL(iters[i]->get_curr_score(term_score))) {
+        } else {
+          score += term_score;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && competitive) {
+      ret = process_collected_row(*candidate, score);
+    }
+    // The candidate ID belongs to an input batch; cache it before refilling.
+    while (OB_SUCC(ret) && winners != 0) {
+      const int64_t i = __builtin_ctzll(winners);
+      winners &= winners - 1;
+      if (OB_FAIL(iters[i]->get_next_row())) {
+        if (OB_ITER_END == ret) {
+          ids[i] = nullptr;
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(iters[i]->get_curr_id(ids[i]))) {
+      }
     }
   }
   return ret;

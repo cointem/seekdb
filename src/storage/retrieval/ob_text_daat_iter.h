@@ -88,8 +88,10 @@ public:
 protected:
   virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual int init_before_wand_process() override;
+  virtual int try_dense_top_k_search(bool &handled) override;
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
+  bool dense_top_k_enabled_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextBMWIter);
 };

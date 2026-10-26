@@ -129,7 +129,21 @@ int ObSRBMWIterImpl::top_k_search()
   int64_t skip_range_cnt = 0;
 
   int64_t pivot_iter_idx = 0;
+  int64_t next_dense_check = 128;
   while (OB_SUCC(ret) && BMWStatus::FINISHED != status_) {
+    // Try a cheaper merge only after observing that block pruning rejects few
+    // candidates. At this boundary all live iterators point to scored rows.
+    if (pivot_cnt >= next_dense_check && BMWStatus::FIND_NEXT_PIVOT == status_) {
+      next_dense_check *= 2;
+      bool handled = false;
+      if (eval_pivot_cnt * 8 >= pivot_cnt * 7 && OB_FAIL(try_dense_top_k_search(handled))) {
+      } else if (handled) {
+        status_ = BMWStatus::FINISHED;
+      }
+      if (OB_FAIL(ret) || BMWStatus::FINISHED == status_) {
+        break;
+      }
+    }
     switch (status_) {
     case BMWStatus::FIND_NEXT_PIVOT: {
       if (OB_FAIL(next_pivot(pivot_iter_idx))) {

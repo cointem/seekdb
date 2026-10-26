@@ -17,6 +17,9 @@
 #ifndef OB_BLOCK_MAX_ITER_H_
 #define OB_BLOCK_MAX_ITER_H_
 
+#include <cmath>
+#include <limits>
+
 #include "query/das/ob_das_id_protocol.h"
 #include "query/engine/expr/ob_expr_bm25.h"
 #include "ob_block_stat_iter.h"
@@ -131,12 +134,20 @@ inline int ObBlockMaxScoreCalc<ObBlockMaxBM25RankingParam>::calc_max_score(const
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "unexpected null value", K(ret), K(max_token_freq_datum), K(min_doc_length_datum));
   } else {
-    max_score = sql::ObExprBM25::eval(
-        max_token_freq_datum.get_int(),
-        min_doc_length_datum.get_int(),
-        ranking_param_.doc_freq_,
-        ranking_param_.total_doc_cnt_,
-        ranking_param_.avg_doc_token_cnt_);
+    // The stored pair maximizes TF at average length 1, not at the query's
+    // average length. Re-evaluating that document can underestimate other
+    // documents in the block. For r = tf / (tf + a + b * len), and A >= 1,
+    // tf / (tf + a + b * len / A) <= r / (r + (1 - r) / A).
+    // The right side is monotone in r; for A <= 1, r itself is an upper bound.
+    double weight = sql::ObExprBM25::doc_token_weight(
+        max_token_freq_datum.get_int(), min_doc_length_datum.get_int());
+    weight = std::min(1.0, weight + 8 * std::numeric_limits<double>::epsilon());
+    if (ranking_param_.avg_doc_token_cnt_ > 1.0) {
+      weight = weight / (weight + (1.0 - weight) / ranking_param_.avg_doc_token_cnt_);
+    }
+    max_score = std::nextafter(weight * sql::ObExprBM25::query_token_weight(
+        ranking_param_.doc_freq_, ranking_param_.total_doc_cnt_),
+        std::numeric_limits<double>::infinity());
   }
   return ret;
 }

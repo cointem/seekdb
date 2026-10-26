@@ -42,6 +42,7 @@ public:
 protected:
   virtual int process_collected_row(const ObDatum &id_datum, const double relevance) override;
   virtual int init_before_wand_process() { return OB_SUCCESS; }
+  virtual int try_dense_top_k_search(bool &handled) { handled = false; return OB_SUCCESS; }
 
   int top_k_search();
   int build_top_k_heap();
