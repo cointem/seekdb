@@ -16,6 +16,9 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include "file_sql_bridge.h"
+#include "common/json_type/ob_json_tree.h"
+#include "common/json_type/ob_json_base.h"
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
@@ -3923,9 +3926,178 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   return ret;
 }
 
+int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&table)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObString secure_root;
+  ObDMLStmt *stmt = get_stmt();
+  ObJsonObject options(allocator_);
+  const ParseNode *name = node.children_[0];
+  const ParseNode *args = node.children_[1];
+  const ParseNode *alias = node.children_[2];
+  ObString function(name->str_len_, name->str_value_);
+  ObString format;
+  if (function.case_compare("read_csv") == 0) {
+    format = "csv";
+  } else if (function.case_compare("read_json") == 0 || function.case_compare("read_ndjson") == 0) {
+    format = "json";
+  } else if (function.case_compare("read_parquet") == 0) {
+    format = "parquet";
+  } else if (function.case_compare("glob") == 0) {
+    format = "glob";
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown file table function");
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL is disabled; set enable_file_sql=ON");
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (args == nullptr || args->num_child_ < 1) {
+    ret = OB_ERR_PARSER_SYNTAX;
+    LOG_WARN("file table requires a path argument", K(ret), KP(args));
+  }
+  auto add_string = [&](ObString key, ObString value) -> int {
+    ObJsonString *json = OB_NEWx(ObJsonString, allocator_, value);
+    return json == nullptr ? OB_ALLOCATE_MEMORY_FAILED : options.add(key, json);
+  };
+  if (OB_SUCC(ret)) {
+    ret = add_string("format", format);
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < args->num_child_; ++i) {
+    const ParseNode *value = args->children_[i];
+    ObString key("path");
+    if (i > 0) {
+      if (value->type_ != T_OP_EQ || value->num_child_ != 2 ||
+          value->children_[0]->type_ != T_COLUMN_REF || value->children_[0]->num_child_ != 3 ||
+          value->children_[0]->children_[0] != nullptr || value->children_[0]->children_[1] != nullptr) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "expected a named file reader option", 0, "", 1);
+      } else {
+        const ParseNode *option = value->children_[0]->children_[2];
+        key.assign_ptr(option->str_value_, option->str_len_);
+        value = value->children_[1];
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (key.case_compare("path") == 0 || key.case_compare("delim") == 0 ||
+               key.case_compare("delimiter") == 0 || key.case_compare("nullstr") == 0 || key.case_compare("format") == 0) {
+      if (value->type_ != T_VARCHAR && value->type_ != T_CHAR) {
+        ret = OB_ERR_PARSER_SYNTAX;
+        LOG_WARN("file reader option must be a literal string", K(ret), K(key), K(value->type_));
+      } else {
+        ObString text(value->str_len_, value->str_value_);
+        if (key.case_compare("format") == 0) {
+          if (format != "json" || text.case_compare("newline_delimited") != 0) {
+            ret = OB_NOT_SUPPORTED;
+          }
+        } else {
+          ObString canonical = key.case_compare("path") == 0 ? ObString("path") :
+              key.case_compare("nullstr") == 0 ? ObString("nullstr") : ObString("delimiter");
+          ret = add_string(canonical, text);
+        }
+      }
+    } else if (key.case_compare("header") == 0 && format == "csv") {
+      if (value->type_ != T_BOOL) {
+        ret = OB_ERR_PARSER_SYNTAX;
+      } else {
+        ObJsonBoolean *header = OB_NEWx(ObJsonBoolean, allocator_, value->value_ != 0);
+        ret = header == nullptr ? OB_ALLOCATE_MEMORY_FAILED : options.add("header", header);
+      }
+    } else if (key.case_compare("sample_size") == 0) {
+      int64_t sample = 0;
+      if (value->type_ == T_INT) {
+        sample = value->value_;
+      } else if (value->type_ == T_OP_NEG && value->num_child_ == 1 && value->children_[0]->type_ == T_INT) {
+        sample = -value->children_[0]->value_;
+      }
+      if (sample != -1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only sample_size=-1 is supported");
+      } else {
+        ObJsonInt *number = OB_NEWx(ObJsonInt, allocator_, sample);
+        ret = number == nullptr ? OB_ALLOCATE_MEMORY_FAILED : options.add("sample_size", number);
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file reader option");
+    }
+  }
+  ObString binding;
+  ObIJsonBase *json = nullptr;
+  ObJsonBuffer buffer(allocator_);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(options.print(buffer, 0))) {
+  } else {
+    try {
+      rust::String result = file_sql::bind_file(rust::Str(buffer.ptr(), buffer.length()),
+          rust::Str(secure_root.empty() ? "" : secure_root.ptr(), secure_root.length()));
+      ret = ob_write_string(*allocator_, ObString(result.size(), result.data()), binding);
+    } catch (const rust::Error &error) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(allocator_, binding, ObJsonInType::JSON_TREE,
+                                                   ObJsonInType::JSON_TREE, json))) {
+  } else if (OB_ISNULL(table = stmt->create_table_item(*allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ObConstRawExpr *value = nullptr;
+    table->type_ = TableItem::FUNCTION_TABLE;
+    table->table_id_ = generate_table_id();
+    table->table_name_ = alias == nullptr ? function : ObString(alias->str_len_, alias->str_value_);
+    table->alias_name_ = table->table_name_;
+    if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*params_.expr_factory_, ObVarcharType,
+                    binding, CS_TYPE_UTF8MB4_BIN, value))) {
+    } else if (OB_FAIL(value->formalize(session_info_))) {
+    } else if (OB_FALSE_IT(table->function_table_expr_ = value)) {
+    } else if (OB_FAIL(stmt->add_table_item(session_info_, table))) {
+    } else {
+      ObJsonArray *columns = static_cast<ObJsonArray *>(static_cast<ObJsonObject *>(json)->get_value("columns"));
+      for (int64_t i = 0; OB_SUCC(ret) && i < columns->element_count(); ++i) {
+        ObJsonObject *column = static_cast<ObJsonObject *>(columns->get_value(i));
+        ObString name = static_cast<ObJsonString *>(column->get_value("name"))->get_str();
+        ObString kind = static_cast<ObJsonString *>(column->get_value("kind"))->get_str();
+        ObObjMeta meta;
+        ObObjType type = kind == "Bigint" ? ObIntType : kind == "Double" ? ObDoubleType :
+            kind == "Boolean" ? ObTinyIntType : kind == "Date" ? ObDateType :
+            kind == "Datetime" ? ObDateTimeType : kind == "Null" ? ObNullType : ObVarcharType;
+        meta.set_type(type);
+        meta.set_collation_type(ob_is_string_type(type) ? CS_TYPE_UTF8MB4_BIN : CS_TYPE_BINARY);
+        ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[type];
+        if (type == ObDateTimeType) {
+          const ObJsonNode *precision = column->get_value("precision");
+          accuracy.set_scale(precision == nullptr ? 0 : precision->get_int());
+        }
+        if (type == ObVarcharType) {
+          accuracy.set_length(OB_MAX_VARCHAR_LENGTH);
+        }
+        ColumnItem *item = nullptr;
+        if (OB_FAIL(resolve_function_table_column_item(*table, meta, accuracy, name,
+                    OB_APP_MIN_COLUMN_ID + i, item))) {
+        } else {
+          item->expr_->set_collation_level(CS_LEVEL_IMPLICIT);
+          if (!column->get_value("nullable")->get_boolean() && kind != "Null") {
+            item->expr_->set_result_flag(NOT_NULL_FLAG);
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
                                                TableItem *&tbl_item)
 {
+  if (parse_tree.num_child_ == 3) {
+    return resolve_file_table_item(parse_tree, tbl_item);
+  }
   int ret = OB_SUCCESS;
   ObDMLStmt *stmt = get_stmt();
   ParseNode *alias_node = NULL;
@@ -6777,6 +6949,11 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
     // do nothing ...
   } else if (NULL != (col_item = stmt->get_column_item(table_item.table_id_, column_name))) {
     //exist, ignore resolve...
+  } else if (table_item.function_table_expr_ != nullptr &&
+             table_item.function_table_expr_->is_const_expr() &&
+             table_item.function_table_expr_->get_result_type().is_varchar()) {
+    ret = OB_ERR_BAD_FIELD_ERROR;
+    LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, column_name.length(), column_name.ptr(), "file table");
   } else {
     ObSEArray<ColumnItem, 16> col_items;
     OZ (ObResolverUtils::check_function_table_column_exist(table_item,
@@ -7475,7 +7652,15 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.function_table_expr_->get_result_type().is_ext()) {
+    if (table_item.function_table_expr_->is_const_expr() &&
+        table_item.function_table_expr_->get_result_type().is_varchar()) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < get_stmt()->get_column_size(); ++i) {
+        const ColumnItem *column = get_stmt()->get_column_item(i);
+        if (column->table_id_ == table_item.table_id_) {
+          ret = col_items.push_back(*column);
+        }
+      }
+    } else if (table_item.function_table_expr_->get_result_type().is_ext()) {
       ret = resolve_function_table_column_item_udf(table_item, col_items);
     } else {
       ret = resolve_function_table_column_item_sys_func(table_item, col_items);

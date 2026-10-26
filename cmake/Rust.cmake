@@ -189,12 +189,17 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
   list(APPEND _rust_job_server_options JOB_SERVER_AWARE TRUE)
 endif()
 
+# A stamp keeps Make from touching every secondary output after a Rust-only
+# change. Header mtimes are preserved by build.py when their contents match.
+set(_rust_build_stamp "${_rust_export_dir}/build.stamp")
 add_custom_command(
-  OUTPUT ${_rust_outputs}
+  OUTPUT "${_rust_build_stamp}"
+  BYPRODUCTS ${_rust_outputs}
   COMMAND "${CMAKE_COMMAND}" -E env ${_rust_build_env}
           "${Python3_EXECUTABLE}" "${RUST_WORKSPACE_DIR}/build.py"
           --cargo "${CARGO}" --profile "${_cargo_out_subdir}" ${_cargo_target_args}
           --target-dir "${RUST_TARGET_DIR}" --output "${_rust_export_dir}"
+  COMMAND "${CMAKE_COMMAND}" -E touch "${_rust_build_stamp}"
   WORKING_DIRECTORY "${RUST_WORKSPACE_DIR}"
   DEPENDS ${_rust_inputs} "${CMAKE_CURRENT_LIST_FILE}"
           "${RUST_WORKSPACE_DIR}/build.py" "${RUST_WORKSPACE_DIR}/exports.json"
@@ -202,7 +207,7 @@ add_custom_command(
   ${_rust_job_server_options}
   VERBATIM)
 
-add_custom_target(rust_staticlibs_build DEPENDS ${_rust_outputs})
+add_custom_target(rust_staticlibs_build DEPENDS "${_rust_build_stamp}")
 
 # System libraries the Rust std staticlib depends on.
 if(WIN32)

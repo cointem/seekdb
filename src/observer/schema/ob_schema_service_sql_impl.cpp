@@ -1302,6 +1302,22 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
       ObSysVarClassType sys_var_id = ObSysVariables::get_sys_var_id(i);
       const ObSysVarSchema *sys_var = NULL;
       if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
+        if (ret == OB_ERR_SYS_VARIABLE_UNKNOWN) {
+          // A database created by an older binary has no persisted row for new
+          // variables. Supply the compatibility default until it is upgraded.
+          ret = OB_SUCCESS;
+          ObSysVarSchema fallback;
+          fallback.set_data_type(ObSysVariables::get_type(i));
+          fallback.set_flags(ObSysVariables::get_flags(i));
+          fallback.set_schema_version(fetch_version);
+          if (OB_FAIL(fallback.set_name(ObSysVariables::get_name(i)))) {
+          } else if (OB_FAIL(fallback.set_value(ObSysVariables::get_base_str_value(i)))) {
+          } else if (OB_FAIL(fallback.set_min_val(ObSysVariables::get_min(i)))) {
+          } else if (OB_FAIL(fallback.set_max_val(ObSysVariables::get_max(i)))) {
+          } else if (OB_FAIL(fallback.set_info(ObSysVariables::get_info(i)))) {
+          } else if (OB_FAIL(sys_variable_schema.add_sysvar_schema(fallback))) {
+          }
+        }
       } else if (OB_ISNULL(sys_var)) {
         ret = OB_ERR_UNEXPECTED;
       } else {

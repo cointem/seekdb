@@ -71,7 +71,8 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      copy_options_(alloc)
   {
   }
 
@@ -91,6 +92,7 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  ObExternalFileFormat::StringData copy_options_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -195,6 +197,14 @@ public:
   virtual void destroy() override;
 
 private:
+  int open_copy_writer();
+  int write_copy_row();
+  int finish_copy();
+  void close_copy_writer();
+  int copy_rows();
+  int copy_batches(int64_t size);
+  void *copy_writer_ = nullptr;
+  common::ObArenaAllocator copy_row_allocator_{"CopyRow"};
   int init_env_common();
   int init_csv_env();
   void set_csv_format_options();

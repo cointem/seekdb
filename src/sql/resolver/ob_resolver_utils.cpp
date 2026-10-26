@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_RESV
 
 #include "config_bridge.h"
+#include "common/json_type/ob_json_tree.h"
+#include "common/json_type/ob_json_base.h"
 #include "share/config/ob_config_helper.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 
@@ -121,6 +123,21 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
                                                          ObIArray<ObString> &column_names)
 {
   int ret = OB_SUCCESS;
+  if (table_item.function_table_expr_ != nullptr && table_item.function_table_expr_->is_const_raw_expr() &&
+      table_item.function_table_expr_->get_result_type().is_varchar()) {
+    const ObString binding = static_cast<const ObConstRawExpr *>(table_item.function_table_expr_)->get_value().get_string();
+    ObIJsonBase *json = nullptr;
+    if (OB_FAIL(ObJsonBaseFactory::get_json_base(params.allocator_, binding,
+                  ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
+    } else {
+      auto *columns = static_cast<ObJsonArray *>(static_cast<ObJsonObject *>(json)->get_value("columns"));
+      for (int64_t i = 0; OB_SUCC(ret) && i < columns->element_count(); ++i) {
+        auto *column = static_cast<ObJsonObject *>(columns->get_value(i));
+        ret = column_names.push_back(static_cast<ObJsonString *>(column->get_value("name"))->get_str());
+      }
+    }
+    return ret;
+  }
   ObRawExpr *table_expr = NULL;
   ObPLPackageGuard *package_guard = nullptr;
   const ObUserDefinedType *user_type = NULL;

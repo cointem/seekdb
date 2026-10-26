@@ -37,6 +37,8 @@ int ObExplainLogPlan::generate_normal_raw_plan()
   int ret = OB_SUCCESS;
   if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(!get_stmt()->is_explain_stmt())) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (static_cast<const ObExplainStmt *>(get_stmt())->is_describe_query()) {
+    ret = generate_describe_plan(*static_cast<const ObExplainStmt *>(get_stmt()));
   } else {
     ObLogPlan *child_plan = NULL;
     const ObDMLStmt *child_stmt = NULL;
@@ -105,6 +107,51 @@ int ObExplainLogPlan::generate_normal_raw_plan()
                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             false);
     }
+  }
+  return ret;
+}
+
+int ObExplainLogPlan::generate_describe_plan(const ObExplainStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  const ObDMLStmt *query = stmt.get_explain_query_stmt();
+  ObLogicalOperator *top = nullptr;
+  if (OB_ISNULL(query) || !query->is_select_stmt()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(allocate_values_as_top(top))) {
+  } else {
+    set_plan_root(top);
+    top->mark_is_plan_root();
+    auto *values = static_cast<ObLogValues *>(top);
+    const auto &items = static_cast<const ObSelectStmt *>(query)->get_select_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+      const ObRawExpr *expr = items.at(i).expr_;
+      const ObObjType type = expr->get_result_type().get_type();
+      const char *name = ob_is_integer_type(type) ? "BIGINT" :
+          ob_is_numeric_type(type) ? "DOUBLE" : type == ObDateType ? "DATE" :
+          type == ObDateTimeType || type == ObTimestampType ? "DATETIME" :
+          type == ObNullType ? "NULL" : "VARCHAR";
+      if (type == ObTinyIntType) { name = "BOOLEAN"; }
+      ObObj cells[6];
+      cells[0].set_varchar(items.at(i).alias_name_);
+      cells[1].set_varchar(name);
+      cells[2].set_varchar((expr->get_result_type().get_result_flag() & NOT_NULL_FLAG) ? "NO" : "YES");
+      for (int j = 0; j < 3; ++j) { cells[j].set_collation_type(ObCharset::get_system_collation()); }
+      for (int j = 3; j < 6; ++j) { cells[j].set_null(); }
+      ObNewRow row;
+      row.cells_ = cells;
+      row.count_ = 6;
+      if (OB_FAIL(values->add_row(row))) {
+      }
+    }
+    get_optimizer_context().get_all_exprs().reuse();
+    for (int i = 0; OB_SUCC(ret) && i < 6; ++i) {
+      if (OB_FAIL(allocate_output_expr_for_values_op(*values))) {
+      }
+    }
+    set_max_op_id(1);
+    optimizer_context_.set_packed(false);
+    optimizer_context_.set_plan_type(OB_PHY_PLAN_LOCAL, OB_PHY_PLAN_LOCAL, false);
   }
   return ret;
 }

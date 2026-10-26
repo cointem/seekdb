@@ -108,6 +108,8 @@ public:
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
   }
+  void set_copy_options(common::ObString value) { copy_options_ = value; }
+  common::ObString get_copy_options() const { return copy_options_; }
   inline ObItemType get_into_type() const
   {
     return into_type_;
@@ -188,6 +190,7 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  common::ObString copy_options_;
 };
 }
 }

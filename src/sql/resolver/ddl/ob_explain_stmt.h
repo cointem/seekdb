@@ -44,6 +44,8 @@ public:
   ObExplainStmt();
   virtual ~ObExplainStmt();
   void set_explain_format(ExplainType format) { format_ = format; }
+  bool is_describe_query() const { return describe_query_; }
+  void set_describe_query(bool value) { describe_query_ = value; }
   ExplainType get_explain_type() const { return format_; }
   void set_display_opt(const ObExplainDisplayOpt &opt) { display_opt_ = opt; }
   const ObExplainDisplayOpt &get_display_opt() const { return display_opt_; }
@@ -62,6 +64,7 @@ public:
 private:
   //bool  verbose_;
   ExplainType format_;
+  bool describe_query_ = false;
   ObExplainDisplayOpt display_opt_;
   ObDMLStmt *explain_query_stmt_;
   common::ObString into_table_;

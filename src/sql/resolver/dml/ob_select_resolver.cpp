@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_select_resolver.h"
+#include "common/json_type/ob_json_tree.h"
+#include "common/json_type/ob_json_base.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
 #include "share/ob_time_utility2.h"
 #include "sql/resolver/dml/ob_aggr_expr_push_up_analyzer.h"
@@ -2986,6 +2988,74 @@ int ObSelectResolver::resolve_into_file_node(const ParseNode *list_node, ObSelec
   return ret;
 }
 
+int ObSelectResolver::resolve_copy_file(const ParseNode &node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObJsonObject options(allocator_);
+  auto add_string = [&](ObString key, ObString value) -> int {
+    auto *json = OB_NEWx(ObJsonString, allocator_, value);
+    return json == nullptr ? OB_ALLOCATE_MEMORY_FAILED : options.add(key, json);
+  };
+  if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY is disabled; set enable_file_sql=ON");
+  } else if (OB_FAIL(resolve_into_const_node(node.children_[0], into_item.outfile_name_))) {
+  } else if (OB_FAIL(add_string("path", into_item.outfile_name_.get_string()))) {
+  }
+  const ParseNode *list = node.children_[1];
+  ObSEArray<ObString, 8> seen;
+  for (int64_t i = 0; OB_SUCC(ret) && list != nullptr && i < list->num_child_; ++i) {
+    const ParseNode *option = list->children_[i];
+    const ParseNode *key_node = option->children_[0];
+    const ParseNode *value = option->children_[1];
+    ObString key(key_node->str_len_, key_node->str_value_);
+    for (int64_t j = 0; OB_SUCC(ret) && j < seen.count(); ++j) {
+      if (key.case_compare(seen.at(j)) == 0) { ret = OB_INVALID_ARGUMENT; }
+    }
+    if (OB_SUCC(ret)) { ret = seen.push_back(key); }
+    if (OB_FAIL(ret)) {
+    } else if (key.case_compare("format") == 0) {
+      if (value == nullptr || ObString(value->str_len_, value->str_value_).case_compare("csv") != 0) {
+        ret = OB_NOT_SUPPORTED;
+      }
+    } else if (key.case_compare("header") == 0) {
+      if (value != nullptr && value->type_ != T_BOOL) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        auto *flag = OB_NEWx(ObJsonBoolean, allocator_, value == nullptr || value->value_ != 0);
+        ret = flag == nullptr ? OB_ALLOCATE_MEMORY_FAILED : options.add("header", flag);
+      }
+    } else if (key.case_compare("nullstr") == 0 || key.case_compare("delimiter") == 0 || key.case_compare("delim") == 0) {
+      if (value == nullptr || value->type_ != T_VARCHAR) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        ret = add_string(key.case_compare("nullstr") == 0 ? ObString("nullstr") : ObString("delimiter"),
+                         ObString(value->str_len_, value->str_value_));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY option");
+    }
+  }
+  auto *columns = OB_NEWx(ObJsonArray, allocator_, allocator_);
+  if (OB_SUCC(ret) && columns == nullptr) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+  const auto &items = get_select_stmt()->get_select_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+    auto *name = OB_NEWx(ObJsonString, allocator_, items.at(i).alias_name_);
+    if (name == nullptr) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+    else { ret = columns->append(name); }
+  }
+  ObJsonBuffer buffer(allocator_);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(options.add("columns", columns))) {
+  } else if (OB_FAIL(options.print(buffer, 0))) {
+  } else if (OB_FAIL(ob_write_string(*allocator_, ObString(buffer.length(), buffer.ptr()), into_item.copy_options_))) {
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
@@ -3105,7 +3175,9 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       new(into_item) ObSelectIntoItem();
       into_item->into_type_ = node->type_;
       if (T_INTO_OUTFILE == node->type_) { // into outfile
-        if (is_in_set_query()) {
+        if (node->value_ == 1 && node->num_child_ == 2) {
+          ret = resolve_copy_file(*node, *into_item);
+        } else if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`

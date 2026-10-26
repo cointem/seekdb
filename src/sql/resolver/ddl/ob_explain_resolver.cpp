@@ -39,6 +39,8 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
     ret = OB_SQL_RESOLVER_NO_MEMORY;
     LOG_WARN("failed to create explain stmt");
   } else {
+    explain_stmt->set_describe_query(parse_tree.children_[EXPLAIN_FORMAT] != nullptr &&
+        parse_tree.children_[EXPLAIN_FORMAT]->type_ == T_SHOW_COLUMNS);
     ParseNode *child_node = parse_tree.children_[EXPLAIN_CHILD_STMT];
     ObStmt *child_stmt = NULL;
     ObExplainDisplayOpt opt;
@@ -67,6 +69,8 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
         if (NULL != format) {
           switch (format->type_) {
+          case T_SHOW_COLUMNS:
+            break;
           case T_OUTLINE:
           {
             explain_stmt->set_explain_format(EXPLAIN_OUTLINE);

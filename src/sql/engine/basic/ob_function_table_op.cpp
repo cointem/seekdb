@@ -19,6 +19,10 @@
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/engine/expr/ob_obj_cast_runtime.h"
+#include "common/json_type/ob_json_tree.h"
+#include "common/json_type/ob_json_base.h"
+#include "file_sql_bridge.h"
 
 
 namespace oceanbase
@@ -27,7 +31,7 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, column_ids_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -36,6 +40,8 @@ int ObFunctionTableOp::inner_open()
   already_calc_ = false;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (ObVarcharType == MY_SPEC.value_expr_->datum_meta_.type_) {
+    next_row_func_ = &ObFunctionTableOp::inner_get_next_row_file;
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -49,6 +55,14 @@ int ObFunctionTableOp::inner_rescan()
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
+    if (file_scan_ != nullptr) {
+      try {
+        (*static_cast<rust::Box<file_sql::FileScan> *>(file_scan_))->rescan();
+      } catch (const rust::Error &error) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+      }
+    }
     node_idx_ = 0;
     if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
@@ -62,6 +76,7 @@ int ObFunctionTableOp::inner_rescan()
 
 int ObFunctionTableOp::inner_close()
 {
+  close_file();
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   row_count_ = 0;
@@ -72,6 +87,7 @@ int ObFunctionTableOp::inner_close()
 
 void ObFunctionTableOp::destroy()
 {
+  close_file();
   ObOperator::destroy();
 }
 
@@ -96,6 +112,116 @@ int ObFunctionTableOp::get_current_result(ObObj &result)
     CK (OB_NOT_NULL(data));
     OX (result = (static_cast<ObObj*>(data))[node_idx_++]);
   } while (OB_SUCC(ret) && result.get_meta().get_type() == ObMaxType);
+  return ret;
+}
+
+void ObFunctionTableOp::close_file()
+{
+  using FileBox = rust::Box<file_sql::FileScan>;
+  if (file_scan_ != nullptr) {
+    static_cast<FileBox *>(file_scan_)->~FileBox();
+    ctx_.get_allocator().free(file_scan_);
+    file_scan_ = nullptr;
+  }
+  file_row_allocator_.reset();
+}
+
+int ObFunctionTableOp::inner_get_next_row_file()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  file_row_allocator_.reuse();
+  using FileBox = rust::Box<file_sql::FileScan>;
+  bool enabled = false;
+  ObString secure_root;
+  if (OB_FAIL(ctx_.check_status())) {
+  } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else {
+    try {
+      if (file_scan_ == nullptr) {
+        ObDatum *argument = nullptr;
+        if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, argument))) {
+        } else {
+          const ObString binding = argument->get_string();
+          ObSqlString projection;
+          ret = projection.append("[");
+          for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_ids_.count(); ++i) {
+            ret = projection.append_fmt("%s%lu", i == 0 ? "" : ",", MY_SPEC.column_ids_.at(i) - OB_APP_MIN_COLUMN_ID);
+          }
+          if (OB_SUCC(ret)) { ret = projection.append("]"); }
+          if (OB_SUCC(ret)) {
+            auto scan = file_sql::open_projected_file(rust::Str(binding.ptr(), binding.length()),
+                rust::Str(secure_root.empty() ? "" : secure_root.ptr(), secure_root.length()),
+                rust::Str(projection.ptr(), projection.length()));
+            file_scan_ = OB_NEWx(FileBox, &ctx_.get_allocator(), std::move(scan));
+            if (file_scan_ == nullptr) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        rust::String row = (*static_cast<FileBox *>(file_scan_))->next_row();
+        ObString data;
+        ObIJsonBase *json = nullptr;
+        if (row.empty()) {
+          ret = OB_ITER_END;
+        } else if (OB_FAIL(ob_write_string(file_row_allocator_, ObString(row.size(), row.data()), data))) {
+        } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&file_row_allocator_, data,
+                      ObJsonInType::JSON_TREE, ObJsonInType::JSON_TREE, json))) {
+        } else if (json == nullptr || json->json_type() != ObJsonNodeType::J_ARRAY) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          auto *values = static_cast<ObJsonArray *>(json);
+          for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+            const uint64_t index = MY_SPEC.column_ids_.at(i) - OB_APP_MIN_COLUMN_ID;
+            ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+            ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+            ObObj source;
+            if (index >= values->element_count()) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              ObJsonNode *value = values->get_value(index);
+              switch (value->json_type()) {
+                case ObJsonNodeType::J_NULL: source.set_null(); break;
+                case ObJsonNodeType::J_BOOLEAN: source.set_tinyint(value->get_boolean()); break;
+                case ObJsonNodeType::J_INT: source.set_int(value->get_int()); break;
+                case ObJsonNodeType::J_UINT: source.set_uint64(value->get_uint()); break;
+                case ObJsonNodeType::J_DOUBLE: source.set_double(value->get_double()); break;
+                case ObJsonNodeType::J_DECIMAL: source.set_number(value->get_decimal_data()); break;
+                case ObJsonNodeType::J_STRING:
+                  source.set_varchar(static_cast<ObJsonString *>(value)->get_str());
+                  source.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                  break;
+                default: ret = OB_ERR_UNEXPECTED; break;
+              }
+            }
+            if (OB_SUCC(ret)) {
+              ObObj converted;
+              const ObDataTypeCastParams params = ObBasicSessionInfo::create_dtc_params(ctx_.get_my_session());
+              ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[expr->datum_meta_.type_];
+              ObCastCtx cast(&file_row_allocator_, &params, CM_NONE, expr->obj_meta_.get_collation_type(), &accuracy);
+              ObSqlObjCastRuntime runtime(&ctx_);
+              cast.runtime_ = &runtime;
+              if (source.is_null()) {
+                datum.set_null();
+              } else if (OB_FAIL(ObObjCaster::to_type(expr->datum_meta_.type_,
+                        expr->obj_meta_.get_collation_type(), cast, source, converted))) {
+              } else if (OB_FAIL(datum.from_obj(converted, expr->obj_datum_map_))) {
+              }
+              if (OB_SUCC(ret)) {
+                expr->set_evaluated_projected(eval_ctx_);
+              }
+            }
+          }
+        }
+      }
+    } catch (const rust::Error &error) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+    }
+  }
   return ret;
 }
 

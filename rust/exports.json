@@ -1,4 +1,12 @@
 {
+  "file_sql": {
+    "crate": "file-sql",
+    "headers": {
+      "file_sql_bridge.h": "cxxbridge/include/file-sql/src/lib.rs.h",
+      "rust/cxx.h": "cxxbridge/include/rust/cxx.h"
+    },
+    "deps": []
+  },
   "sql_nio": {
     "crate": "sql-nio",
     "headers": {},
