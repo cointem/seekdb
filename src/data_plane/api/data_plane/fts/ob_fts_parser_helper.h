@@ -39,6 +39,7 @@ namespace storage
 class ObStopWordChecker;
 class ObFTDictHub;
 class ObAddWord;
+class FTParserWorkspace;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -160,7 +161,13 @@ public:
   int init(
       common::ObIAllocator *allocator,
       const common::ObString &parser_name,
-      const common::ObString &parser_properties);
+      const common::ObString &parser_properties,
+      bool reuse_parser = false);
+  // The caller has already validated and materialized the parser properties.
+  int init(common::ObIAllocator *allocator,
+           const common::ObString &parser_name,
+           const ObFTParserProperty &properties,
+           bool reuse_parser = false);
   /**
    * Split document into multiple words
    *
@@ -215,7 +222,8 @@ private:
       const char *fulltext,
       const int64_t fulltext_len,
       common::ObIAllocator &allocator,
-      ObAddWord &add_word);
+      ObAddWord &add_word,
+      FTParserWorkspace *workspace);
   int set_add_word_flag(const ObIFTParserDesc &ftparser_desc);
 private:
   common::ObIAllocator *allocator_;
@@ -224,6 +232,7 @@ private:
   ObAddWordFlag add_word_flag_;
   ObFTParserProperty parser_property_;
   bool is_inited_;
+  FTParserWorkspace *workspace_;
 
 private:
   static constexpr const char *ENTRY_NAME_DOC_LEN = "doc_len";

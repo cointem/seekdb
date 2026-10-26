@@ -34,8 +34,9 @@ class ObFTDictHub;
 class ObIKFTParser final : public ObITokenIterator
 {
 public:
-  ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
+  ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub, ObIAllocator *scratch = nullptr)
       : allocator_(allocator),
+        scratch_allocator_(nullptr == scratch ? allocator : *scratch),
         is_inited_(false),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
@@ -49,6 +50,8 @@ public:
   virtual ~ObIKFTParser() { reset(); }
 
   int init(const ObFTParserParam &param);
+  int restart(const ObFTParserParam &param);
+  void clear_document();
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
@@ -80,6 +83,7 @@ private:
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
   ObIAllocator &allocator_;
+  ObIAllocator &scratch_allocator_;
   bool is_inited_;
 
   ObCollationType coll_type_;

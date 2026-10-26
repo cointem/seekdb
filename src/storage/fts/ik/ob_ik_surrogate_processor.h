@@ -29,6 +29,7 @@ class ObIKSurrogateProcessor : public ObIIKProcessor
 public:
   ObIKSurrogateProcessor() {}
   ~ObIKSurrogateProcessor() override {}
+  void reuse() override { reset(); }
 
   int do_process(TokenizeContext &ctx,
                  const char *ch,

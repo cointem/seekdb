@@ -23,6 +23,7 @@
 #include "sql/das/ob_das_dml_ctx_define.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_doc_word_scan.h"
+#include "data_plane/blocksstable/ob_datum_row.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/geo/ob_srs_provider.h"
 
@@ -51,10 +52,15 @@ public:
   void reset();
   void reuse();
   TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited),
-               "row_count", rows_.count());
+               "row_count", words_.size());
 private:
   lib::MemoryContext merge_memctx_;
-  ObDomainIndexRow rows_;
+  storage::ObFTWordMap words_;
+  storage::ObFTWordMap::const_iterator word_iter_;
+  blocksstable::ObDatumRow current_row_;
+  ObDatum doc_id_;
+  int64_t doc_length_;
+  int64_t word_buckets_;
   uint64_t row_idx_;
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;

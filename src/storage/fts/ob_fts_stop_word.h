@@ -82,7 +82,10 @@ public:
 
 private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
-  typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
+  // Built during FTS initialization and immutable until shutdown. Readers do
+  // not modify buckets or nodes, so concurrent lookups need no bucket locks.
+  typedef common::hash::ObHashSet<storage::ObFTWord,
+      common::hash::NoPthreadDefendMode> StopWordSet;
 
   StopWordSet stopword_set_;
   ObObjMeta stopword_type_;

@@ -19,6 +19,7 @@
 
 #include "lib/charset/ob_charset.h"
 #include "lib/hash/ob_hashmap.h"
+#include "data_plane/fts/ob_fts_word_map_allocator.h"
 #include "object/ob_object.h"
 #include "share/datum/ob_datum_funcs.h"
 
@@ -51,9 +52,28 @@ private:
   ObObjMeta meta_;
 };
 
-// Owned by one segmentation invocation; never shared between workers.
-// The global, read-only stopword dictionary uses a separate container.
-typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
+// Each map and its node pool have one owner; shared stopwords use a separate
+// immutable container. Heap fallback preserves support for arbitrarily many terms.
+using FTWordMapNode = common::hash::HashMapTypes<ObFTWord, int64_t>::AllocType;
+using FTWordMapAllocator = FTWordNodeAllocator<FTWordMapNode>;
+using FTWordMapBase = common::hash::ObHashMap<ObFTWord, int64_t,
+    common::hash::NoPthreadDefendMode, common::hash::hash_func<ObFTWord>,
+    common::hash::equal_to<ObFTWord>, FTWordMapAllocator,
+    common::hash::NormalPointer, FTWordBucketAllocator>;
+class FTWordMap final : public FTWordMapBase
+{
+public:
+  FTWordMap() { get_local_bucket_allocer().set_buffer(buckets_, sizeof(buckets_)); }
+  ~FTWordMap()
+  {
+    // Destroy the table while its inline bucket storage is still alive.
+    if (created()) { destroy(); }
+  }
+private:
+  alignas(std::max_align_t) char buckets_[2048];
+  DISALLOW_COPY_AND_ASSIGN(FTWordMap);
+};
+using ObFTWordMap = FTWordMap;
 
 class ObAddWordFlag final
 {

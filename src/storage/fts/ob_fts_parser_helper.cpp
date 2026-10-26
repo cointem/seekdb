@@ -255,6 +255,41 @@ int ObFTParseData::get_dict_hub(ObFTDictHub *&hub)
 
 ////////////////////////////////////////////////////////////////////////////////
 // ObFTParseHelper
+// This workspace is owned by one helper/operator. No mutable parser state is
+// shared across sessions. Clear all scratch-backed lists before reusing the arena.
+class FTParserWorkspace
+{
+public:
+  FTParserWorkspace(bool is_ik, ObFTDictHub *hub)
+      : objects_("FTParserObjects"), scratch_("FTParserScratch"),
+        ik_(objects_, hub, &scratch_), beng_(objects_), is_ik_(is_ik) {}
+  int open(ObFTParserParam &param, ObITokenIterator *&iter)
+  {
+    int ret = OB_SUCCESS;
+    if (is_ik_) {
+      ret = ik_.restart(param);
+      iter = &ik_;
+    } else {
+      ret = beng_.restart(&param);
+      iter = &beng_;
+    }
+    return ret;
+  }
+  void finish()
+  {
+    if (is_ik_) {
+      ik_.clear_document();
+      scratch_.reuse();
+    }
+  }
+private:
+  ObArenaAllocator objects_;
+  ObArenaAllocator scratch_;
+  ObIKFTParser ik_;
+  ObBEngFTParser beng_;
+  bool is_ik_;
+};
+
 int ObFTParseHelper::segment(
     const ObFTParserProperty &property,
     const int64_t parser_version,
@@ -263,7 +298,8 @@ int ObFTParseHelper::segment(
     const char *ft,
     const int64_t ft_len,
     common::ObIAllocator &allocator,
-    ObAddWord &add_word)
+    ObAddWord &add_word,
+    FTParserWorkspace *workspace)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(parser_version < 0 || nullptr == parser_desc || nullptr == cs || nullptr == ft || 0 >= ft_len)) {
@@ -282,7 +318,7 @@ int ObFTParseHelper::segment(
     param.min_ngram_size_ = property.min_ngram_token_size_;
     param.max_ngram_size_ = property.max_ngram_token_size_;
 
-    if (OB_FAIL(parser_desc->segment(&param, iter))) {
+    if (OB_FAIL(nullptr == workspace ? parser_desc->segment(&param, iter) : workspace->open(param, iter))) {
     } else if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -301,7 +337,9 @@ int ObFTParseHelper::segment(
         ret = OB_SUCCESS;
       }
     }
-    if (OB_NOT_NULL(iter)) {
+    if (nullptr != workspace) {
+      workspace->finish();
+    } else if (OB_NOT_NULL(iter)) {
       parser_desc->free_token_iter(&param, iter);
       iter = nullptr;
     }
@@ -315,7 +353,8 @@ ObFTParseHelper::ObFTParseHelper()
     parser_name_(),
     add_word_flag_(),
     parser_property_(),
-    is_inited_(false)
+    is_inited_(false),
+    workspace_(nullptr)
 {
 }
 
@@ -327,7 +366,28 @@ ObFTParseHelper::~ObFTParseHelper()
 int ObFTParseHelper::init(
     common::ObIAllocator *allocator,
     const common::ObString &parser_name,
-    const common::ObString &parser_properties)
+    const common::ObString &parser_properties,
+    bool reuse_parser)
+{
+  int ret = OB_SUCCESS;
+  ObFTParser parser;
+  ObFTParserProperty properties;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(parser.parse_from_str(parser_name.ptr(), parser_name.length()))) {
+  } else if (OB_FAIL(properties.parse_for_parser_helper(parser, parser_properties))) {
+  } else {
+    ret = init(allocator, parser_name, properties, reuse_parser);
+  }
+  return ret;
+}
+
+int ObFTParseHelper::init(common::ObIAllocator *allocator,
+                          const common::ObString &parser_name,
+                          const ObFTParserProperty &properties,
+                          bool reuse_parser)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -335,14 +395,21 @@ int ObFTParseHelper::init(
   } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
-  } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
   } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
   } else if (OB_ISNULL(parser_desc_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
   } else {
     allocator_ = allocator;
-    is_inited_ = true;
+    parser_property_ = properties;
+    if (reuse_parser && (parser_name_.is_ik() || parser_name_.is_beng())) {
+      ObFTDictHub *hub = nullptr;
+      if (parser_name_.is_ik() && OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
+      } else if (OB_ISNULL(workspace_ = OB_NEW(FTParserWorkspace, "FTParserWork", parser_name_.is_ik(), hub))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+    }
+    is_inited_ = OB_SUCC(ret);
   }
   if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
     reset();
@@ -352,6 +419,10 @@ int ObFTParseHelper::init(
 
 void ObFTParseHelper::reset()
 {
+  if (nullptr != workspace_) {
+    OB_DELETE(FTParserWorkspace, "FTParserWork", workspace_);
+    workspace_ = nullptr;
+  }
   parser_desc_ = nullptr;
   allocator_ = nullptr;
   add_word_flag_.clear();
@@ -377,7 +448,9 @@ int ObFTParseHelper::segment(
   } else if (OB_ISNULL(cs = common::ObCharset::get_charset(type))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    words.reuse();
+    if (words.size() > 0) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,
@@ -387,7 +460,7 @@ int ObFTParseHelper::segment(
                     fulltext,
                     fulltext_len,
                     *allocator_,
-                    add_word))) {
+                    add_word, workspace_))) {
     } else {
       doc_length = add_word.get_add_word_count();
     }

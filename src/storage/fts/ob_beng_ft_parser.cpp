@@ -49,7 +49,7 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
+  } else if (OB_ISNULL(buf = static_cast<char *>(output_allocator_->alloc(token.len_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     MEMCPY(buf, token.ptr_, token.len_);
@@ -58,6 +58,31 @@ int ObBEngFTParser::get_next_token(
     char_len = token.len_;
     word_freq = token_freq;
     LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+  }
+  return ret;
+}
+
+int ObBEngFTParser::restart(ObFTParserParam *param)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == param || !param->is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (UINT32_MAX < param->ft_length_) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    output_allocator_ = param->allocator_;
+    if (is_inited_ && analysis_ctx_.cs_ != param->cs_) {
+      reset();
+    }
+    if (!is_inited_) {
+      // The pipeline must outlive the caller's document allocator.
+      ObFTParserParam persistent_param = *param;
+      persistent_param.allocator_ = &allocator_;
+      ret = init(&persistent_param);
+    } else {
+      doc_.set_string(param->fulltext_, param->ft_length_);
+      ret = segment(doc_, token_stream_);
+    }
   }
   return ret;
 }

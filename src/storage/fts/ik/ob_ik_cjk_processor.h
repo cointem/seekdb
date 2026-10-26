@@ -34,6 +34,7 @@ public:
   {
   }
   ~ObIKCJKProcessor() override { hits_.reset(); }
+  void reuse() override { hits_.reset(); cjk_start_ = -1; cjk_end_ = -1; }
 
 public:
   int do_process(TokenizeContext &ctx,
