@@ -47,3 +47,11 @@ cmake --build build_release --target seekdb -j 4
 ```
 
 SQL 两个脚本使用 `--client`、`--port`、`--data-dir`，在独立临时 seekdb 实例运行，结束后关闭实例并清理测试数据。构建和运行证据位于工作区外层 `validation/competition/file-sql-audit-*.log`。本记录不宣称运行了整个仓库的 mysqltest 或其他子系统的总回归。
+
+## mysqltest 启动兼容性补验
+
+收到评测日志 `unknown variable 'variable=FILE_SQL_DATA_DIR=...'` 后，使用仓库自带 mysqltest 复现。该客户端不支持 `--variable` 参数，会在连接数据库之前退出；修改数据库实现不能修正评测端的启动命令。
+
+新增 `unittest/sql/engine/file_sql/run_mysqltest.py`，在测试文件中以 `let` 设置目录，复用 `file_sql_basic.test` 的全部 SQL 断言及原有 `.result` 文件。两种部署入口共享 `include/file_sql_queries.inc`，本地入口不依赖 SSH。运行说明见同目录 `README.md`。
+
+在独立临时实例上连续两次执行真实 mysqltest，结果比较均通过；另以不存在的数据库验证失败码会向上传递。成功和失败后都核对了临时目录清理及既有文件保留。证据为工作区外层 `validation/competition/file-sql-mysqltest-validation.log`。此补验不代表赛题方私有评测已经通过；赛题方仍需移除不支持的参数，改用测试文件赋值或兼容入口后重新评测。
