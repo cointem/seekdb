@@ -3,6 +3,7 @@
     "crate": "file-sql",
     "headers": {
       "file_sql_bridge.h": "cxxbridge/include/file-sql/src/lib.rs.h",
+      "file_sql_status.h": "file_sql_status.h",
       "rust/cxx.h": "cxxbridge/include/rust/cxx.h"
     },
     "deps": []

@@ -3934,6 +3934,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   bool enabled = false;
   ObString secure_root;
   ObDMLStmt *stmt = get_stmt();
+  stmt->get_query_ctx()->has_file_sql_ = true;
   ObJsonObject options(allocator_);
   const ParseNode *name = node.children_[0];
   const ParseNode *args = node.children_[1];
@@ -3969,6 +3970,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   if (OB_SUCC(ret)) {
     ret = add_string("format", format);
   }
+  uint64_t seen_options = 0;
   for (int64_t i = 0; OB_SUCC(ret) && i < args->num_child_; ++i) {
     const ParseNode *value = args->children_[i];
     ObString key("path");
@@ -3982,6 +3984,21 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
         const ParseNode *option = value->children_[0]->children_[2];
         key.assign_ptr(option->str_value_, option->str_len_);
         value = value->children_[1];
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const uint64_t option = key.case_compare("path") == 0 ? 1 :
+          (key.case_compare("delim") == 0 || key.case_compare("delimiter") == 0) ? 2 :
+          key.case_compare("nullstr") == 0 ? 4 : key.case_compare("format") == 0 ? 8 :
+          key.case_compare("header") == 0 ? 16 : key.case_compare("sample_size") == 0 ? 32 : 0;
+      const bool applicable = (i == 0 && option == 1) ||
+          (format == "csv" && (option == 2 || option == 4 || option == 16 || option == 32)) ||
+          (format == "json" && (option == 8 || option == 32));
+      if (!applicable || (seen_options & option) != 0) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "duplicate or inapplicable file reader option");
+      } else {
+        seen_options |= option;
       }
     }
     if (OB_FAIL(ret)) {
@@ -4034,13 +4051,18 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(options.print(buffer, 0))) {
   } else {
+    file_sql::FileSqlStatus status(session_info_, [](void *context) -> int32_t {
+      int code = THIS_WORKER.check_status();
+      if (code == OB_SUCCESS) { static_cast<ObSQLSessionInfo *>(context)->is_terminate(code); }
+      return code;
+    });
     try {
-      rust::String result = file_sql::bind_file(rust::Str(buffer.ptr(), buffer.length()),
-          rust::Str(secure_root.empty() ? "" : secure_root.ptr(), secure_root.length()));
+      rust::String result = file_sql::bind_file_with_status(rust::Str(buffer.ptr(), buffer.length()),
+          rust::Str(secure_root.empty() ? "" : secure_root.ptr(), secure_root.length()), status);
       ret = ob_write_string(*allocator_, ObString(result.size(), result.data()), binding);
     } catch (const rust::Error &error) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+      ret = status.last_status() == OB_SUCCESS ? OB_INVALID_ARGUMENT : status.last_status();
+      if (ret == OB_INVALID_ARGUMENT) { LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what()); }
     }
   }
   if (OB_FAIL(ret)) {

@@ -56,11 +56,12 @@ int ObFunctionTableOp::inner_rescan()
   if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
     if (file_scan_ != nullptr) {
+      file_sql::FileSqlStatus status(&ctx_, [](void *context) -> int32_t { return static_cast<ObExecContext *>(context)->check_status(); });
       try {
-        (*static_cast<rust::Box<file_sql::FileScan> *>(file_scan_))->rescan();
+        (*static_cast<rust::Box<file_sql::FileScan> *>(file_scan_))->rescan_with_status(status);
       } catch (const rust::Error &error) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+        ret = status.last_status() == OB_SUCCESS ? OB_INVALID_ARGUMENT : status.last_status();
+        if (ret == OB_INVALID_ARGUMENT) { LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what()); }
       }
     }
     node_idx_ = 0;
@@ -140,6 +141,7 @@ int ObFunctionTableOp::inner_get_next_row_file()
     ret = OB_NOT_SUPPORTED;
   } else if (OB_FAIL(ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
   } else {
+    file_sql::FileSqlStatus status(&ctx_, [](void *context) -> int32_t { return static_cast<ObExecContext *>(context)->check_status(); });
     try {
       if (file_scan_ == nullptr) {
         ObDatum *argument = nullptr;
@@ -153,9 +155,9 @@ int ObFunctionTableOp::inner_get_next_row_file()
           }
           if (OB_SUCC(ret)) { ret = projection.append("]"); }
           if (OB_SUCC(ret)) {
-            auto scan = file_sql::open_projected_file(rust::Str(binding.ptr(), binding.length()),
+            auto scan = file_sql::open_projected_file_with_status(rust::Str(binding.ptr(), binding.length()),
                 rust::Str(secure_root.empty() ? "" : secure_root.ptr(), secure_root.length()),
-                rust::Str(projection.ptr(), projection.length()));
+                rust::Str(projection.ptr(), projection.length()), status);
             file_scan_ = OB_NEWx(FileBox, &ctx_.get_allocator(), std::move(scan));
             if (file_scan_ == nullptr) { ret = OB_ALLOCATE_MEMORY_FAILED; }
           }
@@ -201,6 +203,9 @@ int ObFunctionTableOp::inner_get_next_row_file()
               ObObj converted;
               const ObDataTypeCastParams params = ObBasicSessionInfo::create_dtc_params(ctx_.get_my_session());
               ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[expr->datum_meta_.type_];
+              if (ob_is_datetime_tc(expr->datum_meta_.type_)) {
+                accuracy.set_scale(expr->datum_meta_.scale_);
+              }
               ObCastCtx cast(&file_row_allocator_, &params, CM_NONE, expr->obj_meta_.get_collation_type(), &accuracy);
               ObSqlObjCastRuntime runtime(&ctx_);
               cast.runtime_ = &runtime;
@@ -218,8 +223,8 @@ int ObFunctionTableOp::inner_get_next_row_file()
         }
       }
     } catch (const rust::Error &error) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what());
+      ret = status.last_status() == OB_SUCCESS ? OB_INVALID_ARGUMENT : status.last_status();
+      if (ret == OB_INVALID_ARGUMENT) { LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.what()); }
     }
   }
   return ret;

@@ -2991,6 +2991,7 @@ int ObSelectResolver::resolve_into_file_node(const ParseNode *list_node, ObSelec
 int ObSelectResolver::resolve_copy_file(const ParseNode &node, ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
+  get_select_stmt()->get_query_ctx()->has_file_sql_ = true;
   bool enabled = false;
   ObJsonObject options(allocator_);
   auto add_string = [&](ObString key, ObString value) -> int {
@@ -3011,6 +3012,7 @@ int ObSelectResolver::resolve_copy_file(const ParseNode &node, ObSelectIntoItem 
     const ParseNode *key_node = option->children_[0];
     const ParseNode *value = option->children_[1];
     ObString key(key_node->str_len_, key_node->str_value_);
+    if (key.case_compare("delim") == 0) { key = ObString("delimiter"); }
     for (int64_t j = 0; OB_SUCC(ret) && j < seen.count(); ++j) {
       if (key.case_compare(seen.at(j)) == 0) { ret = OB_INVALID_ARGUMENT; }
     }

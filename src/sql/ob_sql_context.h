@@ -585,7 +585,8 @@ public:
       injected_random_status_(false),
       ori_question_marks_count_(0),
       type_demotion_flag_(0),
-      has_hybrid_search_(false)
+      has_hybrid_search_(false),
+      has_file_sql_(false)
   {
   }
   TO_STRING_KV(N_PARAM_NUM, question_marks_count_,
@@ -627,6 +628,7 @@ public:
     udf_flag_ = 0;
     ori_question_marks_count_ = 0;
     filter_ds_stat_cache_.reuse();
+    has_file_sql_ = false;
     type_demotion_flag_ = 0;
     has_hybrid_search_ = false;
   }
@@ -739,6 +741,7 @@ public:
     };
   };
   bool has_hybrid_search_;
+  bool has_file_sql_; // File schemas, identities and glob results are bound per statement.
 };
 
 } /* ns sql*/
