@@ -103,10 +103,14 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
         word_buckets_ = buckets;
       }
     }
-    if (OB_SUCC(ret) && OB_FAIL(helper_.segment(ft_obj_meta, fulltext.ptr(), fulltext.length(),
-                                               doc_length_, words_))) {
-    } else if (OB_SUCC(ret)) {
-      doc_id_ = doc_id_datum;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(doc_id_.deep_copy(doc_id_datum, merge_memctx_->get_arena_allocator()))) {
+    } else if (OB_FAIL(helper_.segment(ft_obj_meta, fulltext.ptr(), fulltext.length(),
+                                      doc_length_, words_))) {
+    } else {
+      // BENG copies output tokens; the other parsers allocate their casedown
+      // output in the helper allocator. Only the source document ID needs an
+      // independent copy across expression-frame reuse during batch emission.
       word_iter_ = words_.begin();
       if (words_.size() == 0) {
         ret = OB_ITER_END;
@@ -135,6 +139,33 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
     row = &current_row_;
     ++word_iter_;
     ++row_idx_;
+  }
+  return ret;
+}
+
+int ObFTIndexRowCache::get_next_batch(ObDatum *columns[4], int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(capacity <= 0) || OB_ISNULL(columns[0])
+             || OB_ISNULL(columns[1]) || OB_ISNULL(columns[2]) || OB_ISNULL(columns[3])) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t word_idx = is_fts_index_aux_ ? 0 : 1;
+    const int64_t doc_idx = is_fts_index_aux_ ? 1 : 0;
+    // All datums refer to this document's retained parser workspace. Stopping
+    // at the document boundary lets the downstream batch consumer borrow them.
+    while (count < capacity && row_idx_ < words_.size()) {
+      columns[word_idx][count] = word_iter_->first.get_word();
+      columns[doc_idx][count] = doc_id_;
+      columns[2][count].set_uint(word_iter_->second);
+      columns[3][count].set_uint(doc_length_);
+      ++count;
+      ++word_iter_;
+      ++row_idx_;
+    }
   }
   return ret;
 }

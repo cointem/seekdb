@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
+#include "sql/rewrite/ob_fts_count_utils.h"
 #include "config_bridge.h"
 #include "ob_log_plan.h"
 #include "sql/optimizer/ob_pwj_comparer.h"
@@ -12274,10 +12275,11 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    // Start with scalar aggregates: they do not depend on implicit relevance
-    // ordering. Keep nested queries and score-sensitive expressions unchanged.
+    // Scalar aggregates and a proven pure COUNT over a limited view do not
+    // observe relevance ordering. All other nested queries remain scored.
     if (get_stmt()->is_select_stmt()
-        && static_cast<const ObSelectStmt *>(get_stmt())->is_scala_group_by()
+        && (static_cast<const ObSelectStmt *>(get_stmt())->is_scala_group_by()
+            || is_fts_capped_count(get_optimizer_context().get_root_stmt(), get_stmt()))
         && get_stmt()->get_subquery_expr_size() == 0
         && get_stmt()->get_table_size() == 1
         && get_stmt()->get_table_item(0)->is_basic_table()

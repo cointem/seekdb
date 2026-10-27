@@ -75,12 +75,10 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
     ret = OB_ITER_END;
   } else {
     auto advance = [&](int64_t i) -> int {
-      int rc = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i))->get_next_row();
+      int rc = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i))->next_doc_id(iter_domain_ids_[i], MIN(capacity, iter_param_->max_batch_size_));
       if (OB_ITER_END == rc) {
         iter_domain_ids_[i] = nullptr;
         rc = OB_SUCCESS;
-      } else if (OB_SUCCESS == rc) {
-        rc = dim_iters_->at(i)->get_curr_id(iter_domain_ids_[i]);
       }
       return rc;
     };

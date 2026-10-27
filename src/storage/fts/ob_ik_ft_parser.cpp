@@ -69,6 +69,7 @@ int ObIKFTParser::init(const ObFTParserParam &param)
 
 void ObIKFTParser::clear_document()
 {
+  arbitrator_.reuse();
   if (nullptr != ctx_) {
     ctx_->reset_resource();
   }
@@ -201,9 +202,8 @@ int ObIKFTParser::process_next_batch()
     }
 
     if (OB_SUCC(ret) || OB_ITER_END == ret) {
-      ObIKArbitrator arb;
-      if (OB_FAIL(arb.process(*ctx_))) {
-      } else if (OB_FAIL(arb.output_result(*ctx_))) {
+      if (OB_FAIL(arbitrator_.process(*ctx_))) {
+      } else if (OB_FAIL(arbitrator_.output_result(*ctx_))) {
       }
     } else {
       // Already logged.
@@ -340,6 +340,7 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
 
 void ObIKFTParser::reset()
 {
+  arbitrator_.reuse();
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
     allocator_.free(ctx_);

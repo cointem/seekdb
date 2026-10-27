@@ -27,7 +27,7 @@ def main():
     db = 'fts_reuse_' + uuid.uuid4().hex[:10]
 
     def sql(statement):
-        p = subprocess.run(command, input='SET NAMES utf8mb4; SET ob_query_timeout=1000000000;\n' + statement,
+        p = subprocess.run(command, input="SET NAMES utf8mb4; SET sql_mode='NO_AUTO_VALUE_ON_ZERO'; SET ob_query_timeout=1000000000;\n" + statement,
                            text=True, capture_output=True)
         if p.returncode:
             raise RuntimeError(p.stderr)
@@ -47,7 +47,13 @@ def main():
     # reuse it for a short document. Letter-only suffixes survive both parsers.
     unique_words = ['pool' + ''.join(chr(97 + (i // (26 ** j)) % 26)
                                      for j in range(3)) for i in range(2048)]
-    documents += [' '.join(unique_words), 'alpha tail',
+    # Cross several output batch boundaries with unequal token byte lengths,
+    # then switch document IDs and immediately empty the next document.
+    boundary_words = ['batch' + ''.join(chr(97 + (i // (26 ** j)) % 26)
+                                       for j in range(3)) + ('x' * (i % 7))
+                      for i in range(2051)]
+    documents += [' '.join(boundary_words), '', 'batchtail alpha',
+                  ' '.join(unique_words), 'alpha tail',
                   ' '.join(reversed(unique_words)), 'beta']
     documents += [' '.join(rng.choices(atoms, k=rng.randrange(1, 65))) for _ in range(300)]
     documents *= 3
@@ -57,13 +63,15 @@ def main():
                ('beng_custom', 'beng', 'PARSER_PROPERTIES=(min_token_size=2,max_token_size=20)')]
     queries = ['数据库', '全文索引', '三公斤', '北京大学', '中华人民共和国',
                'alpha', 'ALPHA beta', 'ABC123', '数据库 alpha', 'é', 'absentword']
-    queries += [unique_words[0], unique_words[1024], unique_words[-1]]
+    queries += [unique_words[0], unique_words[1024], unique_words[-1],
+                boundary_words[0], boundary_words[1023], boundary_words[1024],
+                boundary_words[2047], boundary_words[-1], 'batchtail']
     results = {}
     sql(f'CREATE DATABASE {db};')
     try:
         for name, analyzer, props in configs:
             table = f'{db}.{name}'
-            sql(f'CREATE TABLE {table}(id INT PRIMARY KEY, body LONGTEXT);')
+            sql(f'CREATE TABLE {table}(id BIGINT AUTO_INCREMENT PRIMARY KEY, body LONGTEXT);')
             for start in range(0, len(documents), 100):
                 values = ','.join(f'({i},{literal(documents[i])})'
                                   for i in range(start, min(start + 100, len(documents))))
@@ -87,6 +95,25 @@ def main():
                         f'INSERT INTO {table} VALUES (10000,"tail beta 北京大学");'
                         f'DROP INDEX ft ON {table};')
             print(f'PASS {name}: two DDL builds over {len(documents)} documents', flush=True)
+        # Expanding one source row must preserve its tablet routing on every
+        # emitted term. Both partitions contain matching rows; misplaced posting
+        # docIDs fail the subsequent docID-to-rowkey lookup (error 4377).
+        layouts = ["PARTITION BY HASH(id) PARTITIONS 2",
+                   "PARTITION BY RANGE(id) SUBPARTITION BY HASH(id) SUBPARTITIONS 2 "
+                   "(PARTITION p0 VALUES LESS THAN(3), PARTITION p1 VALUES LESS THAN(MAXVALUE))"]
+        for layout_id, layout in enumerate(layouts):
+            table = f'{db}.partitioned_{layout_id}'
+            sql(f'CREATE TABLE {table}(id INT PRIMARY KEY, body VARCHAR(4096)) {layout};'
+                f"INSERT INTO {table} VALUES (1,'test1'),(2,'test1 test2'),"
+                "(3,'test1 test2 test3'),(4,'test1 test2 test3 test4'),"
+                "(5,'test1 test2 test3 test4 test5');"
+                f'CREATE FULLTEXT INDEX ft ON {table}(body);')
+            match = "MATCH(body) AGAINST('test1 test2')"
+            actual_ids = sql(f'SELECT id FROM {table} WHERE {match} ORDER BY id;').splitlines()
+            assert actual_ids == ['1', '2', '3', '4', '5'], (layout, actual_ids)
+            actual_count = sql(f'SELECT COUNT(*) FROM {table} WHERE {match};').strip()
+            assert actual_count == '5', (layout, actual_count)
+        print('PASS hash/subpartition FTS DDL tablet routing', flush=True)
         if args.snapshot:
             args.snapshot.write_text(json.dumps(results, ensure_ascii=False, sort_keys=True) + '\n')
         else:

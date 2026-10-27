@@ -20,6 +20,7 @@
 #include "sql/engine/expr/ob_expr_arg_case.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
+#include "sql/rewrite/ob_fts_count_utils.h"
 #include "sql/pl/ob_pl_resolver.h"
 #include "sql/engine/expr/ob_expr_align_date4cmp.h"
 #include "query/vector/ob_vector_index_util.h"
@@ -178,7 +179,21 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
       }
     }
     if (OB_SUCC(ret)) {
-      if (stmt->get_match_exprs().count() > 0 &&
+      const ObDMLStmt *parent = parent_stmts.empty() ? nullptr : parent_stmts.at(parent_stmts.count() - 1).stmt_;
+      if (is_fts_capped_count(parent, stmt)) {
+        // A pure COUNT(*) observes neither retained row values nor relevance
+        // order. A dummy projection also lets the normal covering-index check
+        // avoid fetching a base-table id that nobody consumes.
+        ObConstRawExpr *one = nullptr;
+        ObSelectStmt *inner = static_cast<ObSelectStmt *>(stmt);
+        if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_, ObIntType, 1, one))) {
+        } else {
+          for (int64_t i = 0; i < inner->get_select_item_size(); ++i) {
+            inner->get_select_item(i).expr_ = one;
+          }
+          trans_happened = true;
+        }
+      } else if (stmt->get_match_exprs().count() > 0 &&
           OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;

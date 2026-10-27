@@ -113,7 +113,13 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
 
   int64_t char_len = 0;
   ObIKTokenChain *chain = nullptr;
+  int64_t chain_idx = 0;
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
+    while (chain_idx < chains_.count() && chains_.at(chain_idx)->min_offset() < current) {
+      ++chain_idx;
+    }
+    chain = chain_idx < chains_.count() && chains_.at(chain_idx)->min_offset() == current
+        ? chains_.at(chain_idx) : nullptr;
     ObFTCharUtil::CharType type;
     // maybe not so good to keep single, check it later
     if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
@@ -126,9 +132,7 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                          type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
+    } else if (nullptr == chain) {
       if (!keep_single()) {
         // skip single word
       } else {
@@ -298,15 +302,19 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
   return ret;
 }
 
+void ObIKArbitrator::reuse()
+{
+  // All chains and their list nodes belong to this batch. Drop pointers before
+  // reusing the arena; result tokens are value copies owned by the context.
+  if (chains_.count() > 1024) { chains_.reset(); } else { chains_.reuse(); }
+  if (alloc_.used() > 256 * 1024) { alloc_.reset(); } else { alloc_.reuse(); }
+}
+
 int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
-  int ret = OB_SUCCESS;
-
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
-  }
-  return ret;
+  UNUSED(ctx);
+  reuse();
+  return OB_SUCCESS;
 }
 
 ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
@@ -318,15 +326,15 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else if (OB_FAIL(chains_.push_back(chain))) {
   }
   return ret;
 }
 
 ObIKArbitrator::~ObIKArbitrator()
 {
-  chains_.destroy();
-  alloc_.reset();
+  chains_.reset();
+  alloc_.reuse();
 }
 } // namespace storage
 } // namespace oceanbase

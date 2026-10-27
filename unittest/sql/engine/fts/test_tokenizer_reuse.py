@@ -29,7 +29,13 @@ def main():
              "Alpha", "alpha", "ABC123", "ß", "İ", "é", "Ｅ１２", "カタカナ", "한국어",
              "𠀀", "😀", "the", "and", "123.45", "-", "\t", "\n", "，", "。​"]
     texts = [None, "", " ", "the and", "数据库数据库数据库", "alpha " * 1000,
-             "全文索引测试𠀀😀" * 300, "AaBb 123 ＡＢＣ１２３", "e\u0301 é ß İ"]
+             "全文索引测试𠀀😀" * 300, "AaBb 123 ＡＢＣ１２３", "e\u0301 é ß İ",
+             # Alternate input slices and converted temporary normalization buffers.
+             "alpha ALPHA alpha beta BETA gamma GAMMA alpha",
+             "...alpha!!! ALPHA beta, BETA abc123 ABC123",
+             # Multiple IK batches and arbitration chains, followed by tiny input.
+             "中华人民共和国 北京大学 三公斤 数据库 abc123 " * 1100,
+             "数据库 a"]
     texts += [" ".join(rng.choices(words, k=rng.randrange(1, 80))) for _ in range(247)]
     statements = []
     for text in texts:

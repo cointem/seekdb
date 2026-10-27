@@ -2199,7 +2199,9 @@ ERRSIM_POINT_DEF(EN_TABLE_SCAN_RETRY_WAIT_EVENT_ERRSIM);
 int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
+  if (OB_UNLIKELY(MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_)) {
+    ret = inner_get_next_fts_index_batch(max_row_cnt);
+  } else if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
     if (OB_FAIL(rand_scan_processor_.inner_get_next_batch(max_row_cnt))) {
     }
   } else if (OB_FAIL(inner_get_next_batch_for_tsc(max_row_cnt))) {
@@ -3619,6 +3621,66 @@ int ObTableScanOp::fill_generated_cellid_mbr(
         eval_info->evaluated_ = true;
         eval_info->projected_ = true;
       }
+    }
+  }
+  return ret;
+}
+
+int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t max_row_cnt)
+{
+  int ret = OB_SUCCESS;
+  int64_t capacity = MIN(max_row_cnt, MY_SPEC.max_batch_size_);
+  ObEvalCtx::BatchInfoScopeGuard batch_guard(eval_ctx_);
+  batch_guard.set_batch_idx(0);
+  batch_guard.set_batch_size(1);
+  brs_.size_ = 0;
+  brs_.end_ = false;
+  clear_evaluated_flag();
+  if (OB_UNLIKELY(capacity <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!fts_index_.has_next() && OB_FAIL(fetch_next_fts_index_rows())) {
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      brs_.end_ = true;
+    }
+  }
+  if (OB_SUCC(ret) && !brs_.end_) {
+    // Resolve columns once per batch, rather than once for every emitted term.
+    const ObExprOperatorType *types = MY_SPEC.is_fts_index_aux_
+        ? ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE : ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE;
+    ObExpr *exprs[4] = {nullptr, nullptr, nullptr, nullptr};
+    ObDatum *columns[4] = {nullptr, nullptr, nullptr, nullptr};
+    for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+      if (OB_FAIL(get_output_fts_col_expr_by_type(types[i], exprs[i]))) {
+      } else if (OB_ISNULL(exprs[i])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (exprs[i]->is_batch_result()) {
+        // Numeric setters write through datum.ptr_; merely locating the array
+        // leaves uninitialized or previously borrowed pointers in batch slots.
+        columns[i] = exprs[i]->locate_datums_for_update(eval_ctx_, capacity);
+      } else {
+        // Preserve scalar expression layouts (for example old plan shapes).
+        capacity = 1;
+        columns[i] = &exprs[i]->locate_datum_for_write(eval_ctx_);
+      }
+    }
+    // Reading the source document evaluated row zero as the unsegmented text.
+    // Replace those flags together with the generated output datums.
+    clear_evaluated_flag();
+    if (OB_SUCC(ret) && OB_FAIL(fts_index_.get_next_batch(columns, capacity, brs_.size_))) {
+    }
+    if (OB_SUCC(ret)) {
+      brs_.skip_->reset(brs_.size_);
+      brs_.all_rows_active_ = true;
+      for (int64_t i = 0; i < 4; ++i) {
+        if (exprs[i]->is_batch_result()) {
+          exprs[i]->get_evaluated_flags(eval_ctx_).set_all(brs_.size_);
+        }
+        exprs[i]->get_eval_info(eval_ctx_).evaluated_ = true;
+        exprs[i]->get_eval_info(eval_ctx_).projected_ = true;
+      }
+      LOG_DEBUG("fts ddl output batch", K(MY_SPEC.id_), K(MY_SPEC.is_fts_index_aux_),
+                K(capacity), K(brs_.size_));
     }
   }
   return ret;

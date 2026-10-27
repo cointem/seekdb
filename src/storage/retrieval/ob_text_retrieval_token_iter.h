@@ -133,6 +133,22 @@ public:
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
 public:
+  // Scoreless merge consumes a copied batch directly, avoiding two virtual
+  // calls per posting. Refill only after all IDs in the previous batch expired.
+  int next_doc_id(const ObDatum *&id, const int64_t capacity)
+  {
+    int ret = OB_SUCCESS;
+    id = nullptr;
+    if (OB_LIKELY((++cur_idx_) < count_)) {
+    } else {
+      int64_t count = 0;
+      ret = get_next_batch(MIN(capacity, max_batch_size_), count);
+    }
+    if (OB_SUCC(ret)) {
+      id = &doc_id_[cur_idx_].get_datum();
+    }
+    return ret;
+  }
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
     int ret = OB_SUCCESS;

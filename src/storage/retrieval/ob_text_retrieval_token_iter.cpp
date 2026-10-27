@@ -470,29 +470,13 @@ void ObTextRetrievalDaaTTokenIter::reset()
 }
 
 // Sparse Retrieval Dimension Iter Interfaces
-int ObTextRetrievalDaaTTokenIter::get_next_row() {
+int ObTextRetrievalDaaTTokenIter::get_next_row()
+{
   int ret = OB_SUCCESS;
-  bool need_load = false;
   if (OB_LIKELY((++cur_idx_) < count_)) {
-  } else if (!eval_ctx_->is_vectorized() && (OB_FAIL(token_iter_->get_next_row()))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-    }
-  } else if (!eval_ctx_->is_vectorized() && FALSE_IT(count_ = 1)) {
-  } else if (eval_ctx_->is_vectorized() && OB_FAIL(token_iter_->get_next_batch(max_batch_size_, count_))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-    } else if (count_ != 0) {
-      ret = OB_SUCCESS;
-      need_load = true;
-    }
   } else {
-    need_load = true;
-  }
-  if (OB_SUCC(ret) && need_load) {
-    if (OB_NOT_NULL(relevance_expr_)) {
-      if (OB_FAIL(save_relevances_and_docids())) {
-      }
-    } else if (OB_FAIL(save_docids())) {
-    }
+    int64_t count = 0;
+    ret = get_next_batch(max_batch_size_, count);
   }
   return ret;
 }
@@ -505,15 +489,19 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
   } else if (OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *token_iter_->get_skip(), count_))) {
   } else {
     cur_idx_ = 0;
+    int64_t visible_count = 0;
     const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        relevance_[i] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+        relevance_[visible_count] = relevance_datum.at(i)->get_double();
+        if (OB_FAIL(doc_id_[visible_count].from_datum(*doc_id_datum.at(i)))) {
+        } else {
+          ++visible_count;
         }
       }
     }
+    count_ = visible_count;
   }
   return ret;
 }
@@ -525,20 +513,50 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     ret = OB_INVALID_ARGUMENT;
   } else {
     cur_idx_ = 0;
+    int64_t visible_count = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
-        };
+        if (OB_FAIL(doc_id_[visible_count].from_datum(*doc_id_datum.at(i)))) {
+        } else {
+          ++visible_count;
+        }
       }
     }
+    count_ = visible_count;
   }
   return ret;
 }
 
 int ObTextRetrievalDaaTTokenIter::get_next_batch(const int64_t capacity, int64_t &count)
 {
-  return OB_NOT_IMPLEMENT;
+  int ret = OB_SUCCESS;
+  count = 0;
+  count_ = 0;
+  cur_idx_ = -1;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    // The DaaT consumer owns this buffer until its next refill. Each token
+    // copies visible IDs before another token overwrites shared eval frames.
+    do {
+      if (eval_ctx_->is_vectorized()) {
+        ret = token_iter_->get_next_batch(MIN(capacity, max_batch_size_), count_);
+      } else if (OB_SUCC(ret = token_iter_->get_next_row())) {
+        count_ = 1;
+      }
+      if (OB_ITER_END == ret && count_ > 0) {
+        ret = OB_SUCCESS;
+      }
+      if (OB_SUCC(ret) && count_ > 0) {
+        ret = nullptr != relevance_expr_ ? save_relevances_and_docids() : save_docids();
+      }
+    } while (OB_SUCC(ret) && count_ == 0);
+    count = count_;
+  }
+  return ret;
 }
 
 int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)

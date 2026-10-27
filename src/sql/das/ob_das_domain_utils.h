@@ -49,6 +49,9 @@ public:
       const common::ObString &parser_properties);
   int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext);
   int get_next_row(blocksstable::ObDatumRow *&row);
+  // Borrows term bytes until segment()/reuse(); never crosses a document.
+  int get_next_batch(ObDatum *columns[4], int64_t capacity, int64_t &count);
+  bool has_next() const { return row_idx_ < words_.size(); }
   void reset();
   void reuse();
   TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited),
