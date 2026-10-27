@@ -17,6 +17,7 @@
 #ifndef OB_FTS_PARSER_HELPER_H_
 #define OB_FTS_PARSER_HELPER_H_
 
+#include <atomic>
 #include "lib/allocator/ob_fifo_allocator.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/string/ob_string.h"
@@ -116,6 +117,7 @@ public:
 
   int init();
   void destroy();
+  uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
 
 public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
@@ -128,6 +130,7 @@ private:
 private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
+  std::atomic<uint64_t> generation_{0};
   common::ObFIFOAllocator handler_allocator_;
   bool                    is_inited_         = false;
 };
@@ -210,6 +213,7 @@ public:
       common::ObIJsonBase *&json_root);
 
   void reset();
+  int64_t retained_workspace_bytes() const;
 
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 

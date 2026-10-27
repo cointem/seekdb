@@ -30,6 +30,7 @@ namespace common
 {
 struct ObDatum;
 class ObIVector;
+class ObObjMeta;
 }
 namespace query
 {
@@ -217,7 +218,9 @@ enum ObDirectInsertWriterLayout
 enum ObDirectInsertInputFormat
 {
   DIRECT_INSERT_ROW_INPUT = 0,
-  DIRECT_INSERT_BATCH_INPUT
+  DIRECT_INSERT_BATCH_INPUT,
+  // Ordered FTS datum arrays; storage adapts them without copying token bytes.
+  DIRECT_INSERT_ORDERED_DATUM_BATCH_INPUT
 };
 
 struct ObDirectInsertWriterRequest final
@@ -235,7 +238,8 @@ struct ObDirectInsertWriterRequest final
     const bool common_valid = tablet_id_.is_valid() && slice_index_ >= 0;
     const bool heap_valid = DIRECT_INSERT_HEAP_WRITER != layout_
         || (parallel_count_ > 0 && autoinc_column_index_ >= 0);
-    const bool batch_valid = DIRECT_INSERT_BATCH_INPUT != input_format_
+    const bool batch_valid = (DIRECT_INSERT_BATCH_INPUT != input_format_
+                              && DIRECT_INSERT_ORDERED_DATUM_BATCH_INPUT != input_format_)
         || (max_batch_size_ > 0 && nullptr != spool_factory_);
     return common_valid && heap_valid && batch_valid;
   }
@@ -257,6 +261,11 @@ class ObIDirectInsertWriter
 public:
   virtual int append_row(const ObDirectInsertRowView &row) = 0;
   virtual int append_batch(const ObDirectInsertBatchView &batch) = 0;
+  // Borrows column-major arrays until return. Only the ordered datum batch
+  // writer accepts this entry point; offset/count describe a contiguous run.
+  virtual int append_datum_batch(common::ObDatum *const *columns,
+      const common::ObObjMeta *const *metas, int64_t column_count,
+      int64_t offset, int64_t count) = 0;
   virtual int close() = 0;
   virtual int64_t get_row_count() const = 0;
   virtual const common::ObTabletID &get_tablet_id() const = 0;

@@ -37,6 +37,7 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
   } else {
     mode_flag_ = param.mode_flag_;
     function_lookup_mode_ = param.function_lookup_mode_;
+    count_only_ = param.count_only_;
     const ObExpr *filter = iter_param_->filter_expr_;
     const ObExpr *hit = iter_param_->relevance_proj_expr_;
     // A small unscored union can merge document IDs directly. Only eliminate
@@ -47,6 +48,8 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
         && sql::NATURAL_LANGUAGE_MODE == mode_flag_ && !function_lookup_mode_
         && dim_iters_->count() <= 8 && hit_filter;
     if (hit_union_enabled_) {
+      const ObDatumMeta &id_meta = iter_param_->id_proj_expr_->datum_meta_;
+      count_binary_ids_ = common::ObVarcharType == id_meta.type_ && CS_TYPE_BINARY == id_meta.cs_type_;
       auto *funcs = ObDatumFuncs::get_basic_func(iter_param_->id_proj_expr_->datum_meta_.type_,
           iter_param_->id_proj_expr_->datum_meta_.cs_type_);
       hit_id_cmp_ = funcs->null_first_cmp_;
@@ -62,7 +65,9 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
   count = 0;
-  if (!hit_union_enabled_) {
+  if (count_only_ && hit_union_enabled_) {
+    ret = get_next_count_rows(capacity, count);
+  } else if (!hit_union_enabled_) {
     ret = ObSRDaaTIterImpl::get_next_rows(capacity, count);
   } else if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -130,8 +135,174 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
   return ret;
 }
 
+int ObTextDaaTIter::compare_count_ids(const ObDatum &left, const ObDatum &right, int &cmp) const
+{
+  int ret = OB_SUCCESS;
+  if (count_binary_ids_ && !left.is_null() && !right.is_null()
+      && left.get_string().length() == 16 && right.get_string().length() == 16) {
+    // TABLET_SEQUENCE IDs are stored as native bytes, but ordered by binary
+    // collation. Comparing decoded uint64 values would change that ordering.
+    cmp = MEMCMP(left.ptr_, right.ptr_, 16);
+  } else {
+    ret = hit_id_cmp_(left, right, cmp, nullptr);
+  }
+  return ret;
+}
+
+int ObTextDaaTIter::get_next_count_rows(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  const common::ObLimitParam &limit = *iter_param_->limit_param_;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (capacity < 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (capacity == 0) {
+  } else if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+    ret = OB_ITER_END;
+  } else {
+    const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+    while (OB_SUCC(ret) && count < real_capacity) {
+      const ObDocIdExt *runs[8] = {};
+      int64_t sizes[8] = {};
+      int64_t first = -1;
+      uint64_t winners = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < dim_iters_->count(); ++i) {
+        auto *iter = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i));
+        if ((count_exhausted_ & (1ULL << i)) != 0) {
+        } else if (OB_FAIL(iter->peek_doc_id_run(runs[i], sizes[i], real_capacity))) {
+          if (OB_ITER_END == ret) {
+            count_exhausted_ |= 1ULL << i;
+            ret = OB_SUCCESS;
+          }
+        } else {
+          int cmp = -1;
+          if (first >= 0 && OB_FAIL(compare_count_ids(runs[i][0].get_datum(), runs[first][0].get_datum(), cmp))) {
+          } else if (first < 0 || cmp < 0) {
+            first = i;
+            winners = 1ULL << i;
+          } else if (cmp == 0) {
+            winners |= 1ULL << i;
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (first < 0) {
+        ret = OB_ITER_END;
+      } else {
+        // With one winning stream, every ID strictly below the next stream's
+        // head is unique to it. Consume that whole sorted run without per-hit
+        // winner searches, result ID copies, score markers, or output projections.
+        int64_t run_length = 1;
+        if (0 == (winners & (winners - 1))) {
+          const ObDatum *boundary = nullptr;
+          for (int64_t i = 0; OB_SUCC(ret) && i < dim_iters_->count(); ++i) {
+            if (i != first && sizes[i] > 0) {
+              const ObDatum &head = runs[i][0].get_datum();
+              int cmp = -1;
+              if (nullptr != boundary && OB_FAIL(compare_count_ids(head, *boundary, cmp))) {
+              } else if (nullptr == boundary || cmp < 0) {
+                boundary = &head;
+              }
+            }
+          }
+          run_length = sizes[first];
+          if (OB_SUCC(ret) && nullptr != boundary) {
+            // Gallop from the head before binary search: interleaved streams
+            // usually have a run of one, and must not pay log(batch_size)
+            // comparisons on every hit.
+            int64_t low = 1;
+            int64_t high = MIN(2L, run_length);
+            while (OB_SUCC(ret) && low < run_length) {
+              const int64_t probe = high - 1;
+              int cmp = 0;
+              if (OB_FAIL(compare_count_ids(runs[first][probe].get_datum(), *boundary, cmp))) {
+              } else if (cmp >= 0) {
+                high = probe;
+                break;
+              } else {
+                low = probe + 1;
+                high = MIN(run_length, high * 2);
+              }
+            }
+            while (OB_SUCC(ret) && low < high) {
+              const int64_t mid = low + (high - low) / 2;
+              int cmp = 0;
+              if (OB_FAIL(compare_count_ids(runs[first][mid].get_datum(), *boundary, cmp))) {
+              } else if (cmp < 0) {
+                low = mid + 1;
+              } else {
+                high = mid;
+              }
+            }
+            run_length = low;
+          }
+        } else {
+          // All live streams may share an entire prefix. Count it once and
+          // move all cursors together, instead of repeating the winner search
+          // for each duplicate hit. A nonwinning head forbids this shortcut.
+          bool all_equal = true;
+          int64_t common_size = sizes[first];
+          for (int64_t i = 0; i < dim_iters_->count(); ++i) {
+            if (sizes[i] > 0) {
+              all_equal = all_equal && (winners & (1ULL << i)) != 0;
+              common_size = MIN(common_size, sizes[i]);
+            }
+          }
+          int64_t demand = real_capacity - count;
+          if (limit.is_valid() && input_row_cnt_ < limit.offset_) {
+            demand += MIN(common_size, limit.offset_ - input_row_cnt_);
+          }
+          common_size = MIN(common_size, demand);
+          for (int64_t j = 1; OB_SUCC(ret) && all_equal && j < common_size; ++j) {
+            for (int64_t i = 0; OB_SUCC(ret) && all_equal && i < dim_iters_->count(); ++i) {
+              if (i != first && sizes[i] > 0) {
+                int cmp = 0;
+                if (OB_FAIL(compare_count_ids(runs[first][j].get_datum(), runs[i][j].get_datum(), cmp))) {
+                } else {
+                  all_equal = cmp == 0;
+                }
+              }
+            }
+            if (OB_SUCC(ret) && all_equal) {
+              ++run_length;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          const int64_t skip = limit.is_valid() && input_row_cnt_ < limit.offset_
+              ? MIN(run_length, limit.offset_ - input_row_cnt_) : 0;
+          int64_t emit = MIN(run_length - skip, real_capacity - count);
+          if (limit.is_valid()) {
+            emit = MIN(emit, limit.limit_ - output_row_cnt_);
+          }
+          const int64_t consumed = skip + emit;
+          // Each (token, docID) key is unique after the normal storage MVCC
+          // scan. Equal heads across different tokens contribute only once.
+          while (winners != 0) {
+            const int64_t i = __builtin_ctzll(winners);
+            winners &= winners - 1;
+            static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i))->consume_doc_id_run(consumed);
+          }
+          input_row_cnt_ += consumed;
+          output_row_cnt_ += emit;
+          count += emit;
+          if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+            ret = OB_ITER_END;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 void ObTextDaaTIter::reset()
 {
+  count_only_ = false;
+  count_binary_ids_ = false;
+  count_exhausted_ = 0;
   hit_union_enabled_ = false;
   hit_union_inited_ = false;
   hit_id_cmp_ = nullptr;
@@ -148,6 +319,7 @@ void ObTextDaaTIter::reset()
 void ObTextDaaTIter::reuse(const bool switch_tablet)
 {
   hit_union_inited_ = false;
+  count_exhausted_ = 0;
   if ((OB_NOT_NULL(dim_iters_) && 0 == dim_iters_->count())) {
     // do nothing
   } else {

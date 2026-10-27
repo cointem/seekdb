@@ -30,11 +30,12 @@ class ObScalarAggregateSpec : public ObGroupBySpec
   OB_UNIS_VERSION_V(1);
 public:
   ObScalarAggregateSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObGroupBySpec(alloc, type), enable_hash_base_distinct_(false)
+    : ObGroupBySpec(alloc, type), enable_hash_base_distinct_(false), fts_count_expr_(nullptr)
   {}
 
 public:
   bool enable_hash_base_distinct_;
+  ObExpr *fts_count_expr_; // dedicated local FTS cardinality sink
 
 private:
   // disallow copy
@@ -63,6 +64,7 @@ public:
   // reset default value of %cur_rownum_ && %rownum_limit_
 private:
   int init_hp_infras_group_mgr();
+  int collect_fts_count();
 private:
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObScalarAggregateOp);

@@ -82,6 +82,16 @@ public:
   virtual int inner_close() override;
 
   int64_t get_sort_row_count() const { return sort_row_count_; }
+  bool enable_fts_stable_output_batch()
+  {
+    // Keep prefix/top-N/partition-sort output contracts untouched.
+    if (MY_SPEC.prefix_pos_ > 0 || MY_SPEC.part_cnt_ > 0
+        || nullptr != MY_SPEC.topn_expr_ || nullptr != MY_SPEC.topk_limit_expr_) {
+      return false;
+    }
+    sort_impl_.enable_fts_stable_output_batch();
+    return true;
+  }
 private:
   void reset();
   template <typename T>

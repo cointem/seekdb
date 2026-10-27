@@ -12303,6 +12303,9 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     tr_info.data_table_id_ = ref_table_id;
     tr_info.pushdown_match_filter_ = nullptr;
     tr_info.need_calc_relevance_ = need_calc_relevance;
+    tr_info.count_only_ = !need_calc_relevance
+        && (is_fts_full_count(get_stmt())
+            || is_fts_capped_count(get_optimizer_context().get_root_stmt(), get_stmt()));
   }
   return ret;
 }

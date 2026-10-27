@@ -14,28 +14,7 @@ import subprocess
 import uuid
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--client', required=True)
-    parser.add_argument('--port', type=int, required=True)
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--snapshot', type=Path)
-    mode.add_argument('--compare', type=Path)
-    args = parser.parse_args()
-    command = [args.client, '--no-defaults', '-h127.0.0.1', f'-P{args.port}',
-               '-uroot', '-N', '-s', '--default-character-set=utf8mb4']
-    db = 'fts_reuse_' + uuid.uuid4().hex[:10]
-
-    def sql(statement):
-        p = subprocess.run(command, input="SET NAMES utf8mb4; SET sql_mode='NO_AUTO_VALUE_ON_ZERO'; SET ob_query_timeout=1000000000;\n" + statement,
-                           text=True, capture_output=True)
-        if p.returncode:
-            raise RuntimeError(p.stderr)
-        return p.stdout
-
-    def literal(value):
-        return 'NULL' if value is None else "CONVERT(X'" + value.encode().hex() + "' USING utf8mb4)"
-
+def build_corpus():
     rng = random.Random(73119)
     atoms = ['中华人民共和国', '数据库', '索引', '三公斤', '两百万元', '北京大学',
              'alpha', 'ALPHA', 'beta', 'the', 'ABC123', 'ß', 'İ', 'é', 'e\u0301',
@@ -66,6 +45,32 @@ def main():
     queries += [unique_words[0], unique_words[1024], unique_words[-1],
                 boundary_words[0], boundary_words[1023], boundary_words[1024],
                 boundary_words[2047], boundary_words[-1], 'batchtail']
+    return documents, configs, queries
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--client', required=True)
+    parser.add_argument('--port', type=int, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--snapshot', type=Path)
+    mode.add_argument('--compare', type=Path)
+    args = parser.parse_args()
+    command = [args.client, '--no-defaults', '-h127.0.0.1', f'-P{args.port}',
+               '-uroot', '-N', '-s', '--default-character-set=utf8mb4']
+    db = 'fts_reuse_' + uuid.uuid4().hex[:10]
+
+    def sql(statement):
+        p = subprocess.run(command, input="SET NAMES utf8mb4; SET sql_mode='NO_AUTO_VALUE_ON_ZERO'; SET ob_query_timeout=1000000000;\n" + statement,
+                           text=True, capture_output=True)
+        if p.returncode:
+            raise RuntimeError(p.stderr)
+        return p.stdout
+
+    def literal(value):
+        return 'NULL' if value is None else "CONVERT(X'" + value.encode().hex() + "' USING utf8mb4)"
+
+    documents, configs, queries = build_corpus()
     results = {}
     sql(f'CREATE DATABASE {db};')
     try:
