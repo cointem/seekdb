@@ -3269,6 +3269,20 @@ int ObStaticEngineCG::generate_spec(ObLogGroupBy &op, ObScalarAggregateSpec &spe
     spec.by_pass_enabled_ = false;
     spec.llc_ndv_est_enabled_ = false;
     OZ(set_3stage_info(op, spec));
+    ObLogicalOperator *source = op.get_child(0);
+    while (nullptr != source && log_op_def::LOG_SUBPLAN_SCAN == source->get_type()
+        && source->get_filter_exprs().empty() && source->get_startup_exprs().empty()
+        && source->get_num_of_child() == 1) {
+      source = source->get_child(0);
+    }
+    if (OB_SUCC(ret) && spec.aggr_infos_.count() == 1
+        && op.get_aggr_funcs().count() == 1
+        && op.get_aggr_funcs().at(0)->get_expr_type() == T_FUN_COUNT
+        && op.get_aggr_funcs().at(0)->get_param_count() == 0
+        && nullptr != source && log_op_def::LOG_TABLE_SCAN == source->get_type()
+        && static_cast<const ObLogTableScan *>(source)->is_fts_count_only_scan()) {
+      spec.fts_count_expr_ = spec.aggr_infos_.at(0).expr_;
+    }
   }
   return ret;
 }

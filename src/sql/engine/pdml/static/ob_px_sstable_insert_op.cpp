@@ -21,6 +21,7 @@
 #include "data_plane/blocksstable/ob_datum_row.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 #include "sql/engine/basic/ob_temp_column_spill_spool.h"
+#include "sql/engine/sort/ob_sort_op.h"
 #include "data_plane/ddl/ob_ddl_seq_generator.h"
 
 using namespace oceanbase::common;
@@ -156,7 +157,9 @@ int ObPxMultiPartSSTableInsertOp::inner_get_next_row()
     if (OB_FAIL(write_heap_slice_by_row())) {
     }
   } else {
-    if (OB_FAIL(write_ordered_slice_by_row())) {
+    bool batch_write = false;
+    if (OB_FAIL(check_fts_batch_write(batch_write))) {
+    } else if (OB_FAIL(batch_write ? write_ordered_slice_by_batch() : write_ordered_slice_by_row())) {
     }
     if (OB_SUCC(ret) && need_idempotent_table_autoinc_) {
       if (OB_FAIL(sync_table_level_autoinc_value())) {
@@ -458,6 +461,124 @@ int ObPxMultiPartSSTableInsertOp::get_or_create_heap_writer(
   return ret;
 }
 
+int ObPxMultiPartSSTableInsertOp::check_fts_batch_write(bool &enabled)
+{
+  int ret = OB_SUCCESS;
+  enabled = false;
+  const ObTableSchema *schema = nullptr;
+  ObSqlCtx *sql_ctx = ctx_.get_sql_ctx();
+  if (is_heap_plan() || need_idempotent_tablet_autoinc_
+      || need_idempotent_table_autoinc_ || need_idempotent_doc_id_
+      || child_->get_spec().type_ != PHY_SORT
+      || child_->get_spec().max_batch_size_ <= 1
+      || MY_SPEC.ins_ctdef_.new_row_.count() != 4
+      || nullptr == ins_rtdef_.das_rtdef_.table_loc_
+      || ins_rtdef_.das_rtdef_.table_loc_->get_tablet_locs().size() != 1) {
+  } else if (OB_ISNULL(sql_ctx) || OB_ISNULL(sql_ctx->schema_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(sql_ctx->schema_guard_->get_table_schema(
+                 MY_SPEC.plan_->get_ddl_table_id(), schema))) {
+  } else if (OB_ISNULL(schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!schema->is_partitioned_table()
+             && (schema->is_fts_index_aux() || schema->is_fts_doc_word_aux())) {
+    enabled = true;
+    for (int64_t i = 0; enabled && i < 4; ++i) {
+      enabled = MY_SPEC.ins_ctdef_.new_row_.at(i)->is_batch_result();
+    }
+    if (enabled) {
+      enabled = static_cast<ObSortOp *>(child_)->enable_fts_stable_output_batch();
+    }
+  }
+  return ret;
+}
+
+int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_batch()
+{
+  int ret = OB_SUCCESS;
+  data_plane::ObIDirectInsertWriter *writer = nullptr;
+  const ObExprPtrIArray &exprs = MY_SPEC.ins_ctdef_.new_row_;
+  ObEvalCtx &eval_ctx = get_eval_ctx();
+  ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx);
+  bool prepared = false;
+  int64_t batch_count = 0;
+  while (OB_SUCC(ret) && !is_all_partition_finished_) {
+    const ObBatchRows *batch = nullptr;
+    guard.set_batch_idx(0);
+    if (OB_FAIL(child_->get_next_batch(child_->get_spec().max_batch_size_, batch))) {
+    } else if (OB_ISNULL(batch)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      // Finish all contiguous slice/active runs before requesting another
+      // child batch: every datum and token pointer below belongs to the child.
+      batch_count += batch->size_ > 0 ? 1 : 0;
+      guard.set_batch_size(batch->size_);
+      clear_evaluated_flag();
+      ObDatum *columns[4] = {nullptr, nullptr, nullptr, nullptr};
+      const ObObjMeta *metas[4] = {nullptr, nullptr, nullptr, nullptr};
+      for (int64_t i = 0; OB_SUCC(ret) && batch->size_ > 0 && i < 4; ++i) {
+        if (OB_FAIL(exprs.at(i)->eval_batch(eval_ctx, *batch->skip_, batch->size_))) {
+        } else {
+          columns[i] = exprs.at(i)->locate_batch_datums(eval_ctx);
+          metas[i] = &exprs.at(i)->obj_meta_;
+        }
+      }
+      if (OB_SUCC(ret) && batch->size_ > 0 && nullptr != slice_info_expr_
+          && OB_FAIL(slice_info_expr_->eval_batch(eval_ctx, *batch->skip_, batch->size_))) {
+      }
+      int64_t offset = 0;
+      while (OB_SUCC(ret) && offset < batch->size_) {
+        if (batch->skip_->at(offset)) {
+          ++offset;
+        } else {
+          guard.set_batch_idx(offset);
+          const ObTabletID tablet_id = ins_rtdef_.das_rtdef_.table_loc_->get_first_tablet_loc()->tablet_id_;
+          ObTabletSliceParam slice;
+          if (nullptr != slice_info_expr_) {
+            slice.slice_id_ = slice_info_expr_->locate_expr_datum(eval_ctx).get_int();
+          } else {
+            slice.slice_idx_ = ctx_.get_px_task_id();
+          }
+          if (slice.slice_idx_ < 0 || slice.slice_idx_ >= ObTabletSliceParam::MAX_TABLET_SLICE_COUNT) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (!prepared && OB_FAIL(direct_insert_session_->prepare_ordered_input())) {
+          } else if (FALSE_IT(prepared = true)) {
+          } else if (OB_FAIL(switch_slice_if_need(tablet_id, slice.slice_idx_, writer, nullptr, true))) {
+          } else {
+            int64_t end = offset + 1;
+            while (end < batch->size_ && !batch->skip_->at(end)) {
+              if (nullptr != slice_info_expr_) {
+                guard.set_batch_idx(end);
+                if (slice_info_expr_->locate_expr_datum(eval_ctx).get_int() != slice.slice_id_) {
+                  break;
+                }
+              }
+              ++end;
+            }
+            if (OB_FAIL(writer->append_datum_batch(columns, metas, 4, offset, end - offset))) {
+            } else {
+              op_monitor_info_.otherstat_2_value_ += end - offset;
+              offset = end;
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret) && batch->end_) {
+        is_all_partition_finished_ = true;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && nullptr != writer) {
+    ret = writer->close();
+  }
+  if (nullptr != writer) {
+    data_plane::ObIDirectInsertWriterFactory::destroy(writer);
+  }
+  LOG_INFO("fts ordered datum batch write finished", K(ret), K(batch_count),
+           "rows", op_monitor_info_.otherstat_2_value_, K(MY_SPEC.id_));
+  return ret;
+}
+
 int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row()
 {
   int ret = OB_SUCCESS;
@@ -512,7 +633,8 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row()
 int ObPxMultiPartSSTableInsertOp::switch_slice_if_need(
     const ObTabletID &tablet_id, const int64_t slice_idx,
     data_plane::ObIDirectInsertWriter *&slice_writer,
-    data_plane::ObDirectInsertAutoincParam *autoinc_param/* = nullptr */)
+    data_plane::ObDirectInsertAutoincParam *autoinc_param/* = nullptr */,
+    const bool datum_batch/* = false */)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(nullptr == direct_insert_session_)) {
@@ -539,11 +661,12 @@ int ObPxMultiPartSSTableInsertOp::switch_slice_if_need(
     } else {
       data_plane::ObDirectInsertWriterRequest request;
       request.layout_ = data_plane::DIRECT_INSERT_ORDERED_WRITER;
-      request.input_format_ = data_plane::DIRECT_INSERT_ROW_INPUT;
+      request.input_format_ = datum_batch
+          ? data_plane::DIRECT_INSERT_ORDERED_DATUM_BATCH_INPUT : data_plane::DIRECT_INSERT_ROW_INPUT;
       request.tablet_id_ = tablet_id;
       request.slice_index_ = slice_idx;
-      request.max_batch_size_ = 0;
-      request.append_batch_ = false;
+      request.max_batch_size_ = datum_batch ? child_->get_spec().max_batch_size_ : 0;
+      request.append_batch_ = datum_batch;
       request.spool_factory_ = &get_temp_column_spill_spool_factory();
       if (OB_FAIL(direct_insert_session_->get_writer_factory().create(
               allocator_, request, slice_writer))) {

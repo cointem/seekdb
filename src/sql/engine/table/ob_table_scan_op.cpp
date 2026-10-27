@@ -2210,6 +2210,36 @@ int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
   return ret;
 }
 
+// Local, payload-free FTS count batches terminate at this sink. Ordinary rows,
+// remote tasks and lookup/PX plans must never consume this protocol.
+int ObTableScanOp::get_fts_count(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  const ObDASBaseCtDef *attach = MY_CTDEF.attach_spec_.attach_ctdef_;
+  if (nullptr == attach || DAS_OP_IR_SCAN != attach->op_type_
+      || !static_cast<const ObDASIRScanCtDef *>(attach)->is_count_only()
+      || MY_SPEC.use_dist_das_ || MY_SPEC.gi_above_) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (MY_SPEC.max_batch_size_ > 0) {
+    const ObBatchRows *batch = nullptr;
+    do {
+      if (OB_FAIL(get_next_batch(MY_SPEC.max_batch_size_, batch))) {
+      } else {
+        count += batch->size_ - batch->skip_->accumulate_bit_cnt(batch->size_);
+      }
+    } while (OB_SUCC(ret) && !batch->end_);
+  } else {
+    while (OB_SUCC(ret = get_next_row())) {
+      ++count;
+    }
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
 int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
@@ -3636,52 +3666,65 @@ int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t max_row_cnt)
   brs_.size_ = 0;
   brs_.end_ = false;
   clear_evaluated_flag();
-  if (OB_UNLIKELY(capacity <= 0)) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (!fts_index_.has_next() && OB_FAIL(fetch_next_fts_index_rows())) {
-    if (OB_ITER_END == ret) {
-      ret = OB_SUCCESS;
-      brs_.end_ = true;
+  const ObExprOperatorType *types = MY_SPEC.is_fts_index_aux_
+      ? ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE : ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE;
+  ObExpr *exprs[4] = {nullptr, nullptr, nullptr, nullptr};
+  FTBuildBatchRow *rows = nullptr;
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
+    if (OB_FAIL(get_output_fts_col_expr_by_type(types[i], exprs[i]))) {
+    } else if (OB_ISNULL(exprs[i])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!exprs[i]->is_batch_result()) {
+      capacity = 1;
     }
   }
-  if (OB_SUCC(ret) && !brs_.end_) {
-    // Resolve columns once per batch, rather than once for every emitted term.
-    const ObExprOperatorType *types = MY_SPEC.is_fts_index_aux_
-        ? ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE : ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE;
-    ObExpr *exprs[4] = {nullptr, nullptr, nullptr, nullptr};
-    ObDatum *columns[4] = {nullptr, nullptr, nullptr, nullptr};
-    for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
-      if (OB_FAIL(get_output_fts_col_expr_by_type(types[i], exprs[i]))) {
-      } else if (OB_ISNULL(exprs[i])) {
-        ret = OB_ERR_UNEXPECTED;
-      } else if (exprs[i]->is_batch_result()) {
-        // Numeric setters write through datum.ptr_; merely locating the array
-        // leaves uninitialized or previously borrowed pointers in batch slots.
-        columns[i] = exprs[i]->locate_datums_for_update(eval_ctx_, capacity);
+  if (OB_SUCC(ret) && OB_FAIL(fts_index_.begin_batch(capacity, rows))) {
+  }
+  bool full = false;
+  int64_t token_bytes = 0;
+  int64_t document_chunks = 0;
+  while (OB_SUCC(ret) && !full && !brs_.end_ && brs_.size_ < capacity) {
+    if (!fts_index_.has_next() && OB_FAIL(fetch_next_fts_index_rows())) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        brs_.end_ = true;
+      }
+    }
+    if (OB_SUCC(ret) && !brs_.end_) {
+      // Source reads overwrite expression slot zero and parser reuse releases
+      // the previous document. Stage owned rows before fetching another one.
+      if (OB_FAIL(fts_index_.append_batch(rows, capacity, brs_.size_, token_bytes, full))) {
       } else {
-        // Preserve scalar expression layouts (for example old plan shapes).
-        capacity = 1;
-        columns[i] = &exprs[i]->locate_datum_for_write(eval_ctx_);
+        ++document_chunks;
       }
     }
-    // Reading the source document evaluated row zero as the unsegmented text.
-    // Replace those flags together with the generated output datums.
+  }
+  if (OB_SUCC(ret)) {
     clear_evaluated_flag();
-    if (OB_SUCC(ret) && OB_FAIL(fts_index_.get_next_batch(columns, capacity, brs_.size_))) {
+    ObDatum *columns[4] = {nullptr, nullptr, nullptr, nullptr};
+    for (int64_t i = 0; i < 4; ++i) {
+      columns[i] = exprs[i]->is_batch_result()
+          ? exprs[i]->locate_datums_for_update(eval_ctx_, brs_.size_)
+          : &exprs[i]->locate_datum_for_write(eval_ctx_);
     }
-    if (OB_SUCC(ret)) {
-      brs_.skip_->reset(brs_.size_);
-      brs_.all_rows_active_ = true;
-      for (int64_t i = 0; i < 4; ++i) {
-        if (exprs[i]->is_batch_result()) {
-          exprs[i]->get_evaluated_flags(eval_ctx_).set_all(brs_.size_);
-        }
-        exprs[i]->get_eval_info(eval_ctx_).evaluated_ = true;
-        exprs[i]->get_eval_info(eval_ctx_).projected_ = true;
+    const int64_t word_idx = MY_SPEC.is_fts_index_aux_ ? 0 : 1;
+    const int64_t doc_idx = MY_SPEC.is_fts_index_aux_ ? 1 : 0;
+    for (int64_t i = 0; i < brs_.size_; ++i) {
+      columns[word_idx][i] = rows[i].word_;
+      columns[doc_idx][i] = rows[i].doc_id_;
+      columns[2][i].set_uint(rows[i].word_count_);
+      columns[3][i].set_uint(rows[i].doc_length_);
+    }
+    brs_.skip_->reset(brs_.size_);
+    brs_.all_rows_active_ = true;
+    for (int64_t i = 0; i < 4; ++i) {
+      if (exprs[i]->is_batch_result()) {
+        exprs[i]->get_evaluated_flags(eval_ctx_).set_all(brs_.size_);
       }
-      LOG_DEBUG("fts ddl output batch", K(MY_SPEC.id_), K(MY_SPEC.is_fts_index_aux_),
-                K(capacity), K(brs_.size_));
+      exprs[i]->set_evaluated_projected(eval_ctx_);
     }
+    LOG_DEBUG("fts ddl output batch", K(MY_SPEC.id_), K(MY_SPEC.is_fts_index_aux_),
+              K(capacity), K(brs_.size_), K(document_chunks), K(token_bytes));
   }
   return ret;
 }

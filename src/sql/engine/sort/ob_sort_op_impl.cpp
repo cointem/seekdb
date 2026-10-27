@@ -573,7 +573,8 @@ ObSortOpImpl::ObSortOpImpl() :
   max_node_cnt_(0), part_cnt_(0), topn_cnt_(INT64_MAX), outputted_rows_cnt_(0),
   is_fetch_with_ties_(false), topn_heap_(NULL), ties_array_pos_(0), last_ties_row_(NULL),
   pt_buckets_(NULL), use_partition_topn_sort_(false), heap_nodes_(), cur_heap_idx_(0), rows_(NULL),
-  sort_exprs_(nullptr), compress_type_(NONE_COMPRESSOR)
+  sort_exprs_(nullptr), compress_type_(NONE_COMPRESSOR),
+  fts_stable_output_batch_(false), fts_output_arena_(ObMemAttr("FTSortOutput"))
 {}
 
 ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
@@ -594,7 +595,8 @@ ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
     is_fetch_with_ties_(false), topn_heap_(NULL), ties_array_pos_(0),
     last_ties_row_(NULL), pt_buckets_(NULL), use_partition_topn_sort_(false), heap_nodes_(), cur_heap_idx_(0), part_group_cnt_(0),
     rows_(NULL), sort_exprs_(nullptr),
-    compress_type_(NONE_COMPRESSOR), use_compact_format_(false)
+    compress_type_(NONE_COMPRESSOR), use_compact_format_(false),
+    fts_stable_output_batch_(false), fts_output_arena_(ObMemAttr("FTSortOutput"))
 {
 }
 
@@ -804,6 +806,7 @@ int ObSortOpImpl::init(
 
 void ObSortOpImpl::reuse()
 {
+  fts_output_arena_.reset();
   sorted_ = false;
   iter_.reset();
   default_blk_holder_.release();
@@ -851,6 +854,7 @@ void ObSortOpImpl::unregister_profile_if_necessary()
 
 void ObSortOpImpl::reset()
 {
+  fts_stable_output_batch_ = false;
   sql_mem_processor_.unregister_profile();
   iter_.reset();
   reuse();
@@ -2191,12 +2195,21 @@ int ObSortOpImpl::get_next_batch_stored_rows(int64_t max_cnt, int64_t &read_rows
     ret = OB_NOT_INIT;
   } else {
     read_rows = 0;
+    static constexpr int64_t FTS_OUTPUT_BYTES = 1L << 20;
+    int64_t output_bytes = 0;
+    if (fts_stable_output_batch_) {
+      // Previous output has been consumed before this call. The byte limit is
+      // soft: stop before the next row once reached, at most one row over it.
+      fts_output_arena_.reuse();
+      max_cnt = MIN(max_cnt, 256L);
+    }
     if (use_compact_store()) {
       compact_blk_holder_.release();
     } else {
       default_blk_holder_.release();
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < max_cnt; i++) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < max_cnt
+         && (!fts_stable_output_batch_ || output_bytes < FTS_OUTPUT_BYTES); i++) {
       const ObChunkDatumStore::StoredRow *sr = NULL;
       if (OB_FAIL((this->*next_stored_row_func_)(sr))) {
         // next_stored_row_func_ is safe to return OB_ITER_END twice.
@@ -2210,8 +2223,23 @@ int ObSortOpImpl::get_next_batch_stored_rows(int64_t max_cnt, int64_t &read_rows
       } else if (OB_ISNULL(sr)) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        stored_rows_[read_rows++] = const_cast<ObChunkDatumStore::StoredRow *>(sr);
-        if (use_compact_store()) {
+        ObChunkDatumStore::StoredRow *stable_row = const_cast<ObChunkDatumStore::StoredRow *>(sr);
+        if (fts_stable_output_batch_ && use_compact_store()
+            && next_stored_row_func_ != &ObSortOpImpl::array_next_stored_row) {
+          // A compact reader reuses its single decoded row on the next fetch.
+          // assign() copies the complete payload and relocates datum pointers.
+          // Array rows instead remain owned by datum_store_ and need no copy.
+          if (OB_ISNULL(stable_row = static_cast<ObChunkDatumStore::StoredRow *>(
+                  fts_output_arena_.alloc(sr->row_size_)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (OB_FAIL(stable_row->assign(sr))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          stored_rows_[read_rows++] = stable_row;
+          output_bytes += sr->row_size_;
+        }
+        if (use_compact_store() && !fts_stable_output_batch_) {
           // can't hold multi rows for get_batch, if we use compact/encoding
           break;
         }

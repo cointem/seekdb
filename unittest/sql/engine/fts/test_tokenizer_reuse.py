@@ -43,6 +43,26 @@ def main():
         for name in ("ik", "beng"):
             statements.append(f"SELECT {len(statements)}, TOKENIZE({value}, '{name}', '[{{\"output\":\"all\"}}]');")
 
+    # Constant configurations exercise reusable leases across independent SQL
+    # statements. The last spelling of collation-equivalent words must survive.
+    for coll in ("utf8mb4_bin", "utf8mb4_general_ci", "utf8mb4_unicode_ci"):
+        for output in ("default", "all"):
+            for name in ("space", "beng", "ik"):
+                text = "Alpha alpha À à E e é É ALPHA alpha"
+                value = "CONVERT(X'" + text.encode().hex() + "' USING utf8mb4) COLLATE " + coll
+                options = json.dumps([{"output": output}]).replace("'", "''")
+                statements.append(f"SELECT {len(statements)}, TOKENIZE({value}, '{name}', '{options}');")
+
+    # One constant parser/options expression also processes several rows in a
+    # single execution, including NULL and empty input after a populated map.
+    for name in ("ik", "beng"):
+        rows = []
+        for text in ("数据库 Alpha alpha", "", None, "北京大学 Beta beta"):
+            index = len(statements) + len(rows)
+            value = "NULL" if text is None else "CONVERT(X'" + text.encode().hex() + "' USING utf8mb4)"
+            rows.append(f"SELECT {index} AS case_id, {value} AS body")
+        statements.extend([f"SELECT case_id, TOKENIZE(body, '{name}') FROM (" + " UNION ALL ".join(rows) + ") token_rows;"] + [""] * (len(rows) - 1))
+
     if args.extended:
         variants = {
             "ik": [None, {"ik_mode": "smart"}, {"ik_mode": "max_word"}],

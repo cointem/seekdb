@@ -20,6 +20,8 @@
 #include "data_plane/ddl/ob_direct_load_type.h"
 #include "query/engine/basic/ob_spill_batch_spool.h"
 #include "share/ob_batch_selector.h"
+#include "lib/container/ob_se_array.h"
+#include "lib/allocator/page_arena.h"
 #include "share/ob_ddl_common.h"
 #include "storage/ddl/ob_ddl_dag_thread_pool.h"
 #include "storage/ddl/ob_ddl_insert_dag.h"
@@ -27,6 +29,8 @@
 #include "storage/ddl/ob_ddl_storage_util.h"
 #include "storage/ddl/ob_ddl_direct_load_utils.h"
 #include "storage/ddl/ob_tablet_slice_writer.h"
+#include "storage/ddl/ob_ddl_vector_utils.h"
+#include "query/engine/vector/ob_uniform_base.h"
 #include "data_plane/scheduler/ob_dag_scheduler.h"
 
 namespace oceanbase
@@ -116,7 +120,8 @@ public:
   ObDirectInsertWriterAdapter(common::ObIAllocator &allocator,
                               storage::ObISliceWriter &writer,
                               const DirectInsertWriterImplType type)
-    : allocator_(&allocator), writer_(&writer), type_(type)
+    : datum_vector_arena_(common::ObMemAttr("FTDatumView")),
+      allocator_(&allocator), writer_(&writer), type_(type)
   {}
 
   ~ObDirectInsertWriterAdapter() override
@@ -157,6 +162,42 @@ public:
     return ret;
   }
 
+  int append_datum_batch(common::ObDatum *const *columns,
+      const common::ObObjMeta *const *metas, const int64_t column_count,
+      const int64_t offset, const int64_t count) override
+  {
+    int ret = common::OB_SUCCESS;
+    if (ORDERED_BATCH_WRITER_IMPL != type_ || nullptr == columns || nullptr == metas
+        || column_count != 4 || offset < 0 || count <= 0) {
+      ret = common::OB_INVALID_ARGUMENT;
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+        if (nullptr == columns[i] || nullptr == metas[i]) {
+          ret = common::OB_INVALID_ARGUMENT;
+        }
+      }
+      for (int64_t i = datum_vectors_.count(); OB_SUCC(ret) && i < column_count; ++i) {
+        common::ObIVector *vector = nullptr;
+        const common::ObObjMeta &meta = *metas[i];
+        if (OB_FAIL(storage::ObDDLVectorUtils::new_vector(common::VEC_UNIFORM,
+                common::get_vec_value_tc(meta.get_type(), meta.get_scale(),
+                    meta.is_decimal_int() ? meta.get_stored_precision() : common::PRECISION_UNKNOWN_YET),
+                datum_vector_arena_, vector))) {
+        } else if (OB_FAIL(datum_vectors_.push_back(vector))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+        static_cast<common::ObUniformBase *>(datum_vectors_.at(i))->set_datums(columns[i] + offset);
+      }
+      if (OB_SUCC(ret)) {
+        share::ObBatchSelector selector;
+        selector.set_continous_rows(0, count);
+        ret = writer_->append_current_batch(datum_vectors_, selector);
+      }
+    }
+    return ret;
+  }
+
   int close() override
   {
     return writer_->close();
@@ -186,6 +227,8 @@ private:
   }
 
 private:
+  common::ObArenaAllocator datum_vector_arena_;
+  common::ObSEArray<common::ObIVector *, 4> datum_vectors_;
   common::ObIAllocator *allocator_;
   storage::ObISliceWriter *writer_;
   DirectInsertWriterImplType type_;
@@ -452,6 +495,16 @@ public:
                      write_param, request.parallel_count_,
                      request.autoinc_column_index_,
                      request.idempotent_tablet_autoinc_))) {
+      }
+    } else if (DIRECT_INSERT_ORDERED_DATUM_BATCH_INPUT == request.input_format_) {
+      storage::ObBatchSliceWriter *typed_writer = nullptr;
+      impl_type = ORDERED_BATCH_WRITER_IMPL;
+      if (OB_ISNULL(typed_writer = OB_NEWx(storage::ObBatchSliceWriter, &allocator))) {
+        ret = common::OB_ALLOCATE_MEMORY_FAILED;
+      } else if (FALSE_IT(impl = typed_writer)) {
+      } else if (OB_FAIL(typed_writer->init(write_param,
+                     true /* direct write macro block */, true /* append batch */,
+                     request.max_batch_size_, *request.spool_factory_, true /* borrow batch input */))) {
       }
     } else if (dag_->get_ddl_table_schema().table_item_.vec_dim_ > 0) {
       storage::ObBatchSliceWriter *typed_writer = nullptr;

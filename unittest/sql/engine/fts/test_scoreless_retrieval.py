@@ -122,6 +122,27 @@ def main():
     visible = sum(bool({"alpha", "bravo"}.intersection(tokens)) for tokens in docs.values())
     assert result.splitlines() == [str(min(20, max(visible - 3, 0))), str(min(1, max(visible - 3, 0))), "0", "0"], result
 
+    def verify_count_sink():
+        for rowset in (1, 7, 256):
+            for query in ("", "absentword", "alpha", "alpha alpha bravo", " ".join(words)):
+                expected = sum(bool(set(query.split()).intersection(tokens)) for tokens in docs.values())
+                prefix = f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {rowset}) */ COUNT(*) FROM fts_scoreless_test.docs WHERE "
+                actual = sql(prefix + match(query))
+                oracle = sql(prefix + match(query) + " > 0")
+                assert actual == oracle == str(expected), (query, rowset, actual, oracle, expected)
+        plan = sql("EXPLAIN " + base + match("alpha bravo"))
+        assert "count_only=true" in plan, ("dedicated cardinality sink missing", plan)
+        assert "count_only=true" in sql("EXPLAIN " + capped("alpha bravo")), "limited count sink missing"
+        for statement in (
+            base + match("alpha bravo") + " > 0",
+            "SELECT COUNT(body) FROM fts_scoreless_test.docs WHERE " + match("alpha bravo"),
+            "SELECT COUNT(DISTINCT body) FROM fts_scoreless_test.docs WHERE " + match("alpha bravo"),
+            base + match("alpha bravo") + " AND id > 10",
+            "SELECT SUM(id) FROM fts_scoreless_test.docs WHERE " + match("alpha bravo"),
+        ):
+            assert "count_only=true" not in sql("EXPLAIN " + statement), statement
+
+    verify_count_sink()
     # More than 256 distinct terms selects the existing TAAT fallback.
     long_query = "alpha bravo " + " ".join("term" + str(i) for i in range(300))
     long_matches = [i for i, tokens in docs.items() if set(tokens).intersection({"alpha", "bravo"})]
@@ -144,6 +165,54 @@ def main():
     sql("BEGIN; INSERT INTO fts_scoreless_test.docs VALUES(900,'alpha'); ROLLBACK;")
     verify("alpha", [i for i, tokens in docs.items() if "alpha" in tokens])
     verify_capped()
+    verify_count_sink()
+    # Disjoint and overlapping posting runs, including repeated terms and ID
+    # byte-order transitions beyond 255. Batch sizes force partial consumption
+    # of runs and equal-head groups across refill boundaries.
+    run_docs = {}
+    for i in range(1, 901):
+        tokens = [["alpha", "bravo", "charlie", "delta"][(i % 256) // 64]]
+        if i % 5 == 0:
+            tokens += ["echo"]
+        if i % 11 == 0:
+            tokens += ["alpha", "alpha"]
+        if i % 13 == 0:
+            tokens += ["bravo"]
+        if i % 9 == 0:
+            tokens += ["foxtrot", "hotel"]
+        run_docs[i] = tokens
+    sql("CREATE TABLE fts_scoreless_test.runs(id INT PRIMARY KEY, body TEXT, FULLTEXT INDEX ft(body) WITH PARSER beng); "
+        "INSERT INTO fts_scoreless_test.runs VALUES "
+        + ",".join(f"({i},{literal(' '.join(tokens))})" for i, tokens in run_docs.items()) + ";")
+
+    def verify_runs(rowsets):
+        for rowset in rowsets:
+            statements = []
+            expected = []
+            hint = f"/*+ OPT_PARAM('rowsets_max_rows', {rowset}) */ "
+            for query in ("absentword", "alpha", "alpha alpha bravo", "foxtrot hotel", "alpha bravo charlie delta echo foxtrot hotel"):
+                hits = sum(bool(set(query.split()).intersection(tokens)) for tokens in run_docs.values())
+                for scored in (False, True):
+                    predicate = match(query) + (" > 0" if scored else "")
+                    statements.append("SELECT " + hint + "COUNT(*) FROM fts_scoreless_test.runs WHERE " + predicate)
+                    expected.append(str(hits))
+                    for limit, offset in ((0, 0), (1, 0), (20, 15), (20, 16), (20, 255), (20, 256), (257, 255), (20, 511), (20, 1000)):
+                        statements.append("SELECT COUNT(*) FROM (SELECT " + hint + "id FROM fts_scoreless_test.runs WHERE "
+                                          + predicate + f" LIMIT {limit} OFFSET {offset}) limited")
+                        expected.append(str(min(limit, max(hits - offset, 0))))
+            actual = sql(";".join(statements) + ";").splitlines()
+            assert actual == expected, ("posting run count/refill", rowset, actual, expected)
+
+    verify_runs((1, 2, 7, 16, 64, 256))
+    sql("UPDATE fts_scoreless_test.runs SET body='alpha alpha bravo' WHERE id<=50; "
+        "DELETE FROM fts_scoreless_test.runs WHERE MOD(id,17)=0; "
+        "BEGIN; INSERT INTO fts_scoreless_test.runs VALUES(1001,'alpha bravo'); ROLLBACK;")
+    for i in range(1, 51):
+        run_docs[i] = ["alpha", "alpha", "bravo"]
+    for i in list(run_docs):
+        if i % 17 == 0:
+            del run_docs[i]
+    verify_runs((7, 64))
     sql("DROP DATABASE fts_scoreless_test;")
     print("PASS: membership, batch boundaries, capped COUNT/LIMIT/OFFSET, score-sensitive fallback, prepared reuse and DML")
 

@@ -44,7 +44,7 @@ ObExprOperatorType ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE[] = {T_FUN_SYS_WORD_SE
 ObExprOperatorType ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE[] = {T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
 
 ObFTIndexRowCache::ObFTIndexRowCache()
-  : words_(), word_iter_(), current_row_(), doc_id_(), doc_length_(0), word_buckets_(0),
+  : merge_memctx_(), batch_memctx_(), words_(), word_iter_(), current_row_(), doc_id_(), doc_length_(0), word_buckets_(0),
     row_idx_(0),
     is_fts_index_aux_(true),
     helper_(),
@@ -143,28 +143,102 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
   return ret;
 }
 
-int ObFTIndexRowCache::get_next_batch(ObDatum *columns[4], int64_t capacity, int64_t &count)
+int ObFTIndexRowCache::begin_batch(int64_t capacity, FTBuildBatchRow *&rows)
 {
   int ret = OB_SUCCESS;
-  count = 0;
+  rows = nullptr;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (OB_UNLIKELY(capacity <= 0) || OB_ISNULL(columns[0])
-             || OB_ISNULL(columns[1]) || OB_ISNULL(columns[2]) || OB_ISNULL(columns[3])) {
+  } else if (OB_UNLIKELY(capacity <= 0 || capacity > INT64_MAX / static_cast<int64_t>(sizeof(FTBuildBatchRow)))) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    const int64_t word_idx = is_fts_index_aux_ ? 0 : 1;
-    const int64_t doc_idx = is_fts_index_aux_ ? 1 : 0;
-    // All datums refer to this document's retained parser workspace. Stopping
-    // at the document boundary lets the downstream batch consumer borrow them.
-    while (count < capacity && row_idx_ < words_.size()) {
-      columns[word_idx][count] = word_iter_->first.get_word();
-      columns[doc_idx][count] = doc_id_;
-      columns[2][count].set_uint(word_iter_->second);
-      columns[3][count].set_uint(doc_length_);
-      ++count;
-      ++word_iter_;
-      ++row_idx_;
+    if (OB_ISNULL(batch_memctx_)) {
+      lib::ContextParam param;
+      param.set_mem_attr("FTBuildBatch", ObCtxIds::DEFAULT_CTX_ID)
+           .set_properties(lib::USE_TL_PAGE_OPTIONAL);
+      ret = CURRENT_CONTEXT->CREATE_CONTEXT(batch_memctx_, param);
+    }
+    if (OB_SUCC(ret)) {
+      batch_memctx_->reset_remain_one_page();
+      void *buffer = batch_memctx_->get_arena_allocator().alloc(capacity * sizeof(FTBuildBatchRow));
+      if (OB_ISNULL(buffer)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        rows = static_cast<FTBuildBatchRow *>(buffer);
+        for (int64_t i = 0; i < capacity; ++i) {
+          new (&rows[i]) FTBuildBatchRow();
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFTIndexRowCache::append_batch(FTBuildBatchRow *rows, int64_t capacity,
+                                  int64_t &count, int64_t &token_bytes, bool &full)
+{
+  int ret = OB_SUCCESS;
+  static constexpr int64_t MAX_BATCH_TOKEN_BYTES = 1L << 20;
+  full = false;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(rows) || OB_UNLIKELY(count < 0 || count >= capacity || token_bytes < 0
+                                   || token_bytes > MAX_BATCH_TOKEN_BYTES)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t desired = MIN(capacity - count, static_cast<int64_t>(words_.size() - row_idx_));
+    const int64_t doc_id_bytes = doc_id_.is_null() ? 0 : doc_id_.len_;
+    int64_t bytes = doc_id_bytes;
+    int64_t take = 0;
+    auto iter = word_iter_;
+    while (take < desired) {
+      const int64_t word_bytes = iter->first.get_word().len_;
+      if (bytes > MAX_BATCH_TOKEN_BYTES - token_bytes
+          || word_bytes > MAX_BATCH_TOKEN_BYTES - token_bytes - bytes) {
+        break;
+      }
+      bytes += word_bytes;
+      ++iter;
+      ++take;
+    }
+    if (0 == take) {
+      if (0 == count && desired > 0) {
+        // A single legal token can exceed the copy budget. Emit just that row
+        // borrowing the current document and do not advance the source scan.
+        rows[count].word_ = word_iter_->first.get_word();
+        rows[count].doc_id_ = doc_id_;
+        rows[count].word_count_ = word_iter_->second;
+        rows[count].doc_length_ = doc_length_;
+        ++word_iter_;
+        ++row_idx_;
+        ++count;
+      }
+      full = true;
+    } else {
+      char *buffer = static_cast<char *>(batch_memctx_->get_arena_allocator().alloc(bytes));
+      ObDatum batch_doc_id;
+      int64_t pos = 0;
+      if (OB_ISNULL(buffer)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(batch_doc_id.deep_copy(doc_id_, buffer, bytes, pos))) {
+      } else {
+        token_bytes += bytes;
+        // One allocation per document chunk, rather than one per posting.
+        // Shared docID bytes and term bytes all live until begin_batch().
+        for (int64_t i = 0; OB_SUCC(ret) && i < take; ++i) {
+          FTBuildBatchRow &row = rows[count];
+          if (OB_FAIL(row.word_.deep_copy(word_iter_->first.get_word(), buffer, bytes, pos))) {
+          } else {
+            row.doc_id_ = batch_doc_id;
+            row.word_count_ = word_iter_->second;
+            row.doc_length_ = doc_length_;
+            ++count;
+            ++word_iter_;
+            ++row_idx_;
+          }
+        }
+      }
+      full = count == capacity || take < desired;
     }
   }
   return ret;
@@ -181,6 +255,10 @@ void ObFTIndexRowCache::reset()
   if (OB_NOT_NULL(merge_memctx_)) {
     DESTROY_CONTEXT(merge_memctx_);
     merge_memctx_ = nullptr;
+  }
+  if (OB_NOT_NULL(batch_memctx_)) {
+    DESTROY_CONTEXT(batch_memctx_);
+    batch_memctx_ = nullptr;
   }
   is_inited_ = false;
 }

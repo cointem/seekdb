@@ -392,6 +392,10 @@ public:
   virtual int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
                      const int64_t max_cnt, int64_t &read_rows);
 
+  // Only the non-partitioned FTS direct writer opts in. Array rows already
+  // belong to datum_store_; decoded merge rows need batch-owned storage.
+  void enable_fts_stable_output_batch() { fts_stable_output_batch_ = true; }
+
   // rewind get_next_row() iterator to begin.
   int rewind();
 
@@ -882,6 +886,8 @@ protected:
   common::ObCompressorType compress_type_;
   bool use_compact_format_;
   ObPushDownTopNFilter pd_topn_filter_;
+  bool fts_stable_output_batch_;
+  common::ObArenaAllocator fts_output_arena_;
 };
 
 class ObInMemoryTopnSortImpl;

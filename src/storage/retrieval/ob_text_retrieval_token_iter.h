@@ -149,6 +149,29 @@ public:
     }
     return ret;
   }
+  // Count-stream cursor protocol: peek a stable, token-owned batch; consume
+  // only moves its cursor. Refill happens at the next peek, never mid-run.
+  // This protocol is exclusive with get_next_row()/next_doc_id() per rescan.
+  int peek_doc_id_run(const ObDocIdExt *&ids, int64_t &count, const int64_t capacity)
+  {
+    int ret = OB_SUCCESS;
+    ids = nullptr;
+    count = 0;
+    if (cur_idx_ < 0 || cur_idx_ >= count_) {
+      int64_t loaded = 0;
+      ret = get_next_batch(MIN(capacity, max_batch_size_), loaded);
+    }
+    if (OB_SUCC(ret)) {
+      ids = &doc_id_[cur_idx_];
+      count = count_ - cur_idx_;
+    }
+    return ret;
+  }
+  void consume_doc_id_run(const int64_t count)
+  {
+    OB_ASSERT(count >= 0 && cur_idx_ >= 0 && cur_idx_ + count <= count_);
+    cur_idx_ += count;
+  }
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
     int ret = OB_SUCCESS;

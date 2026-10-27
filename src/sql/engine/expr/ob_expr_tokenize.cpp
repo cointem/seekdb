@@ -15,11 +15,13 @@
  */
 
 #include "sql/engine/expr/ob_expr_tokenize.h"
+#include <mutex>
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
+#include "common/json_type/ob_json_bin.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
@@ -27,6 +29,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/ob_json_access_utils.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
@@ -39,6 +42,118 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// DEFAULT output contains only strings. Serialize that flat array into the
+// expression-owned payload, without creating a JSON tree or a temporary binary.
+// Keep the generic tree/serializer path for ALL and for nonconstant config.
+int pack_token_array_binary(const ObExpr &expr, ObEvalCtx &ctx,
+                            const storage::ObFTWordMap &words, ObDatum &datum)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t count = words.size();
+  uint64_t payload_size = 0;
+  for (auto it = words.begin(); OB_SUCC(ret) && it != words.end(); ++it) {
+    const ObString word = it->first.get_word().get_string();
+    const uint64_t size = sizeof(uint8_t)
+        + serialization::encoded_length_vi64(word.length()) + word.length();
+    if (payload_size > static_cast<uint64_t>(INT64_MAX) - size) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      payload_size += size;
+    }
+  }
+
+  ObJsonBinMeta meta;
+  meta.set_type(ObJsonBin::get_array_vertype(), false);
+  meta.set_element_count(count);
+  meta.set_element_count_var_type(ObJsonVar::get_var_type(count));
+  meta.set_is_continuous(true);
+  uint8_t size_type = ObJsonVar::get_var_type(static_cast<uint64_t>(0));
+  uint64_t array_size = 0;
+  uint64_t header_size = 0;
+  // Widening the size/offset fields also grows the entry table. Find its fixed
+  // point before reserving the output, so even width boundaries need no rewrite.
+  while (OB_SUCC(ret)) {
+    const uint64_t width = ObJsonVar::get_var_size(size_type);
+    const uint64_t fixed = sizeof(ObJsonBinArrHeader)
+        + meta.element_count_var_size() + width;
+    if (count > static_cast<uint64_t>(INT32_MAX)
+        || payload_size > static_cast<uint64_t>(INT64_MAX) - fixed
+        || count > (static_cast<uint64_t>(INT64_MAX) - fixed - payload_size)
+                       / (width + OB_JSON_BIN_VALUE_TYPE_LEN)) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      header_size = fixed + count * (width + OB_JSON_BIN_VALUE_TYPE_LEN);
+      array_size = header_size + payload_size;
+      const uint8_t required_type = ObJsonVar::get_var_type(array_size);
+      if (required_type <= size_type) {
+        break;
+      } else {
+        size_type = required_type;
+      }
+    }
+  }
+
+  ObTextStringDatumResult result(expr.datum_meta_.type_, &expr, &ctx, &datum);
+  char *output = nullptr;
+  int64_t capacity = 0;
+  const uint64_t total_size = sizeof(ObJsonBinDocHeader) + array_size;
+  // The document header stores its end offset in 42 bits. The LOB result helper
+  // performs the same result-size and LOB-header checks as pack_json_str_res.
+  if (OB_FAIL(ret)) {
+  } else if (total_size >= (1ULL << 42)) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (OB_FAIL(result.init(total_size))) {
+  } else if (OB_FAIL(result.get_reserved_buffer(output, capacity))) {
+  } else if (static_cast<uint64_t>(capacity) < total_size) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObJsonBinDocHeader doc_header;
+    doc_header.extend_seg_offset_ = total_size;
+    MEMCPY(output, &doc_header, sizeof(doc_header));
+    char *array = output + sizeof(doc_header);
+    meta.set_entry_var_type(size_type);
+    meta.set_obj_size_var_type(size_type);
+    meta.set_obj_size(array_size);
+    ObJsonBinArrHeader array_header;
+    int64_t pos = header_size;
+    int index = 0;
+    if (OB_FAIL(meta.calc_entry_array())) {
+    } else if (OB_FAIL(meta.to_header(array_header))) {
+    } else {
+      MEMCPY(array, &array_header, sizeof(array_header));
+      if (OB_FAIL(ObJsonVar::set_var(count, meta.element_count_var_type(),
+                                   array + meta.get_element_count_offset()))) {
+      } else if (OB_FAIL(ObJsonVar::set_var(array_size, size_type,
+                                          array + meta.get_obj_size_offset()))) {
+      }
+    }
+    for (auto it = words.begin(); OB_SUCC(ret) && it != words.end(); ++it, ++index) {
+      const ObString word = it->first.get_word().get_string();
+      const uint8_t string_type = ObJsonBin::get_string_vertype();
+      if (OB_FAIL(ObJsonBinSerializer::set_value_entry(meta, array, index, pos, string_type))) {
+      } else {
+        array[pos++] = static_cast<char>(string_type);
+        if (OB_FAIL(serialization::encode_vi64(array, array_size, pos, word.length()))) {
+        } else {
+          MEMCPY(array + pos, word.ptr(), word.length());
+          pos += word.length();
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (static_cast<uint64_t>(pos) != array_size) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(result.lseek(total_size, 0))) {
+    } else {
+      result.set_result();
+    }
+  }
+  return ret;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -52,6 +167,9 @@ ObExprTokenize::~ObExprTokenize() {}
 
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
+  if (expr.extra_ != 0) {
+    return eval_reusable(expr, ctx, expr_datum);
+  }
   int ret = OB_SUCCESS;
 
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -72,6 +190,212 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
                                                      expr_datum))) {
   }
 
+  return ret;
+}
+
+int ObExprTokenize::TokenizeContext::make_token_array_json(ObIJsonBase *&result)
+{
+  int ret = OB_SUCCESS;
+  const int64_t count = words_.size();
+  if (count > token_capacity_) {
+    const int64_t capacity = MAX(count, MAX(16, token_capacity_ * 2));
+    void *buf = json_allocator_.alloc(capacity * sizeof(ObJsonString));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      token_nodes_ = static_cast<ObJsonString *>(buf);
+      token_capacity_ = capacity;
+      for (int64_t i = 0; i < capacity; ++i) {
+        new (&token_nodes_[i]) ObJsonString(nullptr, 0);
+      }
+    }
+  }
+  for (auto it = words_.begin(); OB_SUCC(ret) && it != words_.end(); ++it) {
+    const ObString word = it->first.get_word().get_string();
+    ObJsonString &node = token_nodes_[token_count_++];
+    node.set_value(word.ptr(), word.length());
+    ret = token_array_.append(&node);
+  }
+  if (OB_SUCC(ret)) {
+    token_array_.update_serialize_size();
+    result = &token_array_;
+  }
+  return ret;
+}
+
+// Bounded leases reuse parser configuration and scratch across independent SQL
+// executions. A slot is never visible to two callers. No document results live
+// in the pool, and allocation, dictionary IO and parsing happen outside its lock.
+class ObExprTokenize::TokenizePool
+{
+public:
+  static constexpr int64_t CAPACITY = 16;
+  struct Slot { TokenizeContext *state_ = nullptr; bool busy_ = false; };
+  ~TokenizePool()
+  {
+    for (Slot &slot : slots_) {
+      if (nullptr != slot.state_) { OB_DELETE(TokenizeContext, "TokenizePool", slot.state_); }
+    }
+  }
+  TokenizeContext *acquire(const ObString &parser, const ObString &options,
+                          int64_t mask, ObCollationType collation, uint64_t generation, int64_t word_bucket_count,
+                          int64_t &slot_id)
+  {
+    slot_id = -1;
+    if (parser.length() + options.length() > 4096) { return nullptr; }
+    TokenizeContext *old = nullptr;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      int64_t idle = -1;
+      for (int64_t n = 0; n < CAPACITY; ++n) {
+        const int64_t i = (next_victim_ + n) % CAPACITY;
+        Slot &slot = slots_[i];
+        if (!slot.busy_) {
+          if (idle < 0) { idle = i; }
+          TokenizeContext *s = slot.state_;
+          if (nullptr != s && s->configured_ && s->generation_ == generation
+              && s->collation_ == collation && s->null_mask_ == mask
+              && s->word_bucket_count_ == word_bucket_count
+              && s->parser_key_ == parser && s->options_key_ == options) {
+            slot.busy_ = true;
+            slot_id = i;
+            return s;
+          }
+        }
+      }
+      if (idle < 0) { return nullptr; }
+      slot_id = idle;
+      next_victim_ = (idle + 1) % CAPACITY;
+      slots_[idle].busy_ = true;
+      old = slots_[idle].state_;
+      slots_[idle].state_ = nullptr;
+    }
+    if (nullptr != old) { OB_DELETE(TokenizeContext, "TokenizePool", old); }
+    TokenizeContext *s = OB_NEW(TokenizeContext, "TokenizePool");
+    if (nullptr != s) {
+      if (OB_SUCCESS != ob_write_string(s->param_.allocator_, parser, s->parser_key_)
+          || OB_SUCCESS != ob_write_string(s->param_.allocator_, options, s->options_key_)) {
+        OB_DELETE(TokenizeContext, "TokenizePool", s);
+        s = nullptr;
+      } else {
+        s->null_mask_ = mask;
+        s->collation_ = collation;
+        s->generation_ = generation;
+        s->word_bucket_count_ = word_bucket_count;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      slots_[slot_id].state_ = s;
+      if (nullptr == s) { slots_[slot_id].busy_ = false; slot_id = -1; }
+    }
+    return s;
+  }
+  void release(int64_t slot_id, TokenizeContext *state)
+  {
+    state->clear_document();
+    if (state->helper_.retained_workspace_bytes() > 2 * 1024 * 1024
+        || state->json_allocator_.total() > 1024 * 1024) {
+      state->configured_ = false;
+    }
+    // Failed initialization may have partial parser/config state: evict it.
+    TokenizeContext *discard = state->configured_ ? nullptr : state;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      slots_[slot_id].state_ = discard == nullptr ? state : nullptr;
+      slots_[slot_id].busy_ = false;
+    }
+    if (nullptr != discard) { OB_DELETE(TokenizeContext, "TokenizePool", discard); }
+  }
+private:
+  std::mutex lock_;
+  Slot slots_[CAPACITY];
+  int64_t next_victim_ = 0;
+};
+
+int ObExprTokenize::eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &datum)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx::TempAllocGuard key_guard(ctx);
+  MultimodeAlloctor key_allocator(key_guard.get_allocator());
+  ObDatum *fulltext = nullptr;
+  if (OB_FAIL(expr.args_[0]->eval(ctx, fulltext))) { return ret; }
+  const int64_t text_length = fulltext->is_null() ? 0 : fulltext->get_string().length();
+  const int64_t bucket_count = MIN(MAX(text_length / 2, 2), 997);
+  ObString parser_key;
+  ObString options_key;
+  int64_t mask = expr.arg_cnt_ << 2;
+  for (int64_t i = 1; OB_SUCC(ret) && i < expr.arg_cnt_; ++i) {
+    ObDatum *arg = nullptr;
+    if (OB_FAIL(expr.args_[i]->eval(ctx, arg))) {
+    } else if (arg->is_null()) {
+      mask |= 1 << (i - 1);
+    } else if (i == 1) {
+      parser_key = arg->get_string();
+    } else {
+      bool is_null = false;
+      // Key the actual JSON/text bytes, never an out-of-row LOB locator.
+      ret = ObJsonExprHelper::get_json_or_str_data(expr.args_[i], ctx,
+          key_allocator, options_key, is_null);
+      if (ob_is_json(expr.args_[i]->datum_meta_.type_)) { mask |= 1 << 8; }
+    }
+  }
+  if (OB_FAIL(ret)) { return ret; }
+  static TokenizePool pool;
+  int64_t slot_id = -1;
+  TokenizeContext *state = pool.acquire(parser_key, options_key, mask,
+      expr.args_[0]->obj_meta_.get_collation_type(),
+      storage::ObFTParseData::instance().generation(), bucket_count, slot_id);
+  if (nullptr == state) { state = OB_NEW(TokenizeContext, "TokenizeLocal"); }
+  if (OB_ISNULL(state)) { return OB_ALLOCATE_MEMORY_FAILED; }
+  struct Lease
+  {
+    TokenizePool &pool_;
+    int64_t slot_id_;
+    TokenizeContext *state_;
+    ~Lease()
+    {
+      if (slot_id_ >= 0) { pool_.release(slot_id_, state_); }
+      else { OB_DELETE(TokenizeContext, "TokenizeLocal", state_); }
+    }
+  } lease{pool, slot_id, state};
+  {
+    ObEvalCtx::TempAllocGuard guard(ctx);
+    ObArenaAllocator &tmp = guard.get_allocator();
+    TokenizeParam &param = state->param_;
+    if (!state->configured_) {
+      // Keep configuration storage separate from the arena reused per document.
+      // Only publish the initialized state after every step succeeds.
+      if (OB_FAIL(parse_param(expr, ctx, tmp, param))) {
+      } else if (OB_FAIL(state->helper_.init(&state->document_allocator_,
+                                           param.parser_name_, param.parsed_properties_, true))) {
+      } else if (OB_FAIL(state->words_.create(bucket_count, ObMemAttr("TokenizeWords")))) {
+        state->helper_.reset();
+      } else {
+        state->configured_ = true;
+      }
+    } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
+    } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+      // Dictionary loading keeps its existing transaction semantics per row.
+    }
+    int64_t doc_len = 0;
+    ObIJsonBase *json = nullptr;
+    if (OB_SUCC(ret) && !param.fulltext_.empty()
+        && OB_FAIL(state->helper_.segment(param.meta_, param.fulltext_.ptr(),
+                                         param.fulltext_.length(), doc_len, state->words_))) {
+    }
+    if (OB_SUCC(ret)) {
+      if (param.output_mode_ == TokenizeParam::DEFAULT) {
+        ret = pack_token_array_binary(expr, ctx, state->words_, datum);
+      } else if (OB_FAIL(state->helper_.make_detail_json(state->words_, doc_len, json))) {
+      } else {
+        ret = ObJsonExprHelper::pack_json_res(expr, ctx, tmp, json, datum);
+      }
+    }
+    // Both output paths finish in expr-owned storage, so no token or JSON
+    // pointers escape this invocation, including on empty input and errors.
+    if (slot_id < 0) { state->clear_document(); }
+  }
   return ret;
 }
 
@@ -285,6 +609,11 @@ int ObExprTokenize::cg_expr(ObExprCGCtx &op_cg_ctx,
   if (OB_SUCC(ret)) {
     // do register
     rt_expr.eval_func_ = eval_tokenize;
+    bool reusable = true;
+    for (int64_t i = 1; reusable && i < rt_expr.arg_cnt_; ++i) {
+      reusable = raw_expr.get_param_expr(i)->is_const_expr();
+    }
+    rt_expr.extra_ = reusable ? 1 : 0;
   }
   return ret;
 }

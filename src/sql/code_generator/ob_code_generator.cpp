@@ -133,6 +133,29 @@ int ObCodeGenerator::generate_operators(const ObLogPlan &log_plan,
   return ret;
 }
 
+static int check_fts_posting_batch(const ObLogPlan &log_plan, bool &posting_batch)
+{
+  int ret = OB_SUCCESS;
+  posting_batch = false;
+  ObOptimizerContext &opt_ctx = log_plan.get_optimizer_context();
+  const TableItem *target = nullptr;
+  const share::schema::ObTableSchema *schema = nullptr;
+  if (!opt_ctx.is_insert_stmt_in_online_ddl()) {
+  } else if (OB_ISNULL(opt_ctx.get_root_stmt()) || OB_ISNULL(opt_ctx.get_schema_guard())
+      || OB_ISNULL(target = opt_ctx.get_root_stmt()->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(opt_ctx.get_schema_guard()->get_table_schema(target->ddl_table_id_, schema))) {
+  } else if (OB_ISNULL(schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // Match the table-scan posting batch path. Partitioned FTS DDL retains its
+    // scalar tablet/PDML routing protocol.
+    posting_batch = !schema->is_partitioned_table()
+        && (schema->is_fts_index_aux() || schema->is_fts_doc_word_aux());
+  }
+  return ret;
+}
+
 int ObCodeGenerator::detect_batch_size(
     const ObLogPlan &log_plan, int64_t &batch_size)
 {
@@ -197,11 +220,30 @@ int ObCodeGenerator::detect_batch_size(
           exec_ctx->get_physical_plan_ctx()->get_original_param_cnt(),
           0);
       int64_t rowsets_max_rows = config::_rowsets_max_rows();
+      bool posting_batch = false;
+      bool has_rowsets_hint = false;
+      bool has_lob_rowsets_hint = false;
+      OZ(check_fts_posting_batch(log_plan, posting_batch));
+      OZ(opt_params->has_opt_param(ObOptParamHint::ROWSETS_MAX_ROWS, has_rowsets_hint));
+      OZ(opt_params->has_opt_param(ObOptParamHint::LOB_ROWSETS_MAX_ROWS, has_lob_rowsets_hint));
+      // A default source estimate of one document does not describe the
+      // expanded postings. Avoid only the tiny-scan heuristic, before frame
+      // allocation; retain all expression, LOB and side-effect limits. Explicit
+      // rowset hints keep the established sizing and precedence unchanged.
+      const bool use_posting_default = posting_batch && !has_rowsets_hint && !has_lob_rowsets_hint;
+      const double batch_cardinality = use_posting_default
+          ? MAX(scan_cardinality, static_cast<double>(ObStaticEngineExprCG::SMALL_SCAN_CARDINALITY))
+          : scan_cardinality;
       OZ(expr_cg.detect_batch_size(flattened_exprs, batch_size,
                                    rowsets_max_rows,
                                    config::_rowsets_target_maxsize(),
-                                   scan_cardinality,
+                                   batch_cardinality,
                                    lob_rowsets_max_rows));
+      if (OB_SUCC(ret) && use_posting_default) {
+        // Bound default per-expression frames and the batch-owned posting
+        // staging area even when the configured rowset limit is much larger.
+        batch_size = MIN(batch_size, 256);
+      }
       // overwrite batch size if hint is specified
       OZ(opt_params->get_integer_opt_param(ObOptParamHint::ROWSETS_MAX_ROWS, batch_size));
 

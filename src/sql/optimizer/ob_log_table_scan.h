@@ -48,6 +48,7 @@ struct ObTextRetrievalInfo
     topk_offset_expr_(NULL),
     with_ties_(false),
     need_calc_relevance_(true),
+    count_only_(false),
     inv_idx_tid_(OB_INVALID_ID),
     fwd_idx_tid_(OB_INVALID_ID),
     doc_id_idx_tid_(OB_INVALID_ID),
@@ -78,6 +79,7 @@ struct ObTextRetrievalInfo
   ObRawExpr *topk_offset_expr_;
   bool with_ties_;
   bool need_calc_relevance_;  // match expr just for retireval (accurate score is not required)
+  bool count_only_; // cardinality-only sink; no document payload may escape
   uint64_t inv_idx_tid_;  // chosen aux inverted index table id (word-doc)
   uint64_t fwd_idx_tid_;  // chosen aux forward index table id (doc-word)
   uint64_t doc_id_idx_tid_; // chosen aux doc_id index table id (doc-rowkey)
@@ -834,6 +836,7 @@ public:
   inline const ObIArray<ObTextRetrievalInfo> &get_match_tr_infos() const { return match_tr_infos_; }
   inline ObIArray<ObTextRetrievalInfo> &get_merge_tr_infos() { return merge_tr_infos_; }
   inline const ObIArray<ObTextRetrievalInfo> &get_merge_tr_infos() const { return merge_tr_infos_; }
+  bool is_fts_count_only_scan() const;
   inline bool need_text_retrieval_calc_relevance() const { return text_retrieval_info_.need_calc_relevance_; } // TODO: need to judge function lookup
   inline bool need_rowkey_doc_expr() const
   {

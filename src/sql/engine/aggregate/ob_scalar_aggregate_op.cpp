@@ -18,6 +18,7 @@
 
 #include "config_bridge.h"
 #include "sql/engine/aggregate/ob_scalar_aggregate_op.h"
+#include "sql/engine/table/ob_table_scan_op.h"
 #include "sql/engine/px/ob_px_util.h"
 
 
@@ -26,7 +27,7 @@ namespace oceanbase
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObScalarAggregateSpec, ObGroupBySpec), enable_hash_base_distinct_);
+OB_SERIALIZE_MEMBER((ObScalarAggregateSpec, ObGroupBySpec), enable_hash_base_distinct_, fts_count_expr_);
 
 int ObScalarAggregateOp::inner_open()
 {
@@ -93,11 +94,40 @@ int ObScalarAggregateOp::inner_rescan()
   return ret;
 }
 
+int ObScalarAggregateOp::collect_fts_count()
+{
+  int ret = OB_SUCCESS;
+  int64_t count = 0;
+  ObOperator *source = child_;
+  // Code generation admits only the strict, filter-free derived-table wrapper.
+  while (nullptr != source && PHY_SUBPLAN_SCAN == source->get_spec().type_) {
+    source = source->get_child();
+  }
+  if (nullptr == source || PHY_TABLE_SCAN != source->get_spec().type_ || nullptr == MY_SPEC.fts_count_expr_) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(static_cast<ObTableScanOp *>(source)->get_fts_count(count))) {
+  } else {
+    ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+    guard.set_batch_size(1);
+    guard.set_batch_idx(0);
+    MY_SPEC.fts_count_expr_->locate_datum_for_write(eval_ctx_).set_int(count);
+    MY_SPEC.fts_count_expr_->get_eval_info(eval_ctx_).evaluated_ = true;
+    if (eval_ctx_.is_vectorized()) {
+      MY_SPEC.fts_count_expr_->get_evaluated_flags(eval_ctx_).set(0);
+    }
+    started_ = true;
+  }
+  return ret;
+}
+
 int ObScalarAggregateOp::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
   if (started_) {
     ret = OB_ITER_END;
+  } else if (nullptr != MY_SPEC.fts_count_expr_) {
+    clear_evaluated_flag();
+    ret = collect_fts_count();
   } else {
     LOG_DEBUG("before inner_get_next_row",
               "aggr_hold_size", aggr_processor_.get_aggr_hold_size(),
@@ -141,6 +171,17 @@ int ObScalarAggregateOp::inner_get_next_row()
 int ObScalarAggregateOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
+  if (nullptr != MY_SPEC.fts_count_expr_) {
+    clear_evaluated_flag();
+    if (started_) {
+      brs_.size_ = 0;
+    } else if (OB_FAIL(collect_fts_count())) {
+    } else {
+      brs_.size_ = 1;
+    }
+    brs_.end_ = true;
+    return ret;
+  }
   int64_t batch_cnt = min(max_row_cnt, MY_SPEC.max_batch_size_);
   ObAggregateProcessor::GroupRow *group_row = nullptr;
   const ObBatchRows * child_brs = nullptr;
