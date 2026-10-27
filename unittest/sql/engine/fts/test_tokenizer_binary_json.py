@@ -135,6 +135,25 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(concurrent_session, range(8)))
+    # Wire conversion must keep every detached JSON payload alive through the
+    # complete row, including several JSON cells and subsequent rows. Use an
+    # independent Python JSON oracle, not the server's other TOKENIZE path.
+    wire_values = [None, True, 42, "", 'quote" slash\\ newline\n tab\t 数据库 😀',
+                   [], {}, ["x" * 600, {"nested": [1, False, None]}],
+                   {"large": "汉字" * 22000, "tail": "kept"}]
+    wire_sql = []
+    expected_wire = {}
+    for index, value in enumerate(wire_values):
+        text = json.dumps(value, ensure_ascii=False)
+        wire_sql.append(f"SELECT 'wire-{index}', CAST({literal(text)} AS JSON);")
+        expected_wire[f"wire-{index}"] = value
+    assert run(command + ["--raw"], wire_sql, args.timeout) == expected_wire, "JSON wire payload changed"
+    multi = ["a" * 1024, {"escaped": 'a"b\\c\n'}, [None, True, "数据库"]]
+    process = subprocess.run(command + ["--raw"], input="SET NAMES utf8mb4;\nSELECT " +
+        ",".join(f"CAST({literal(json.dumps(v, ensure_ascii=False))} AS JSON)" for v in multi) + ";\n",
+        text=True, capture_output=True, timeout=args.timeout)
+    assert process.returncode == 0, process.stderr
+    assert [json.loads(value) for value in process.stdout.strip().split("\t")] == multi
     print(f"PASS: {len(actual)} ordered JSON results match tree oracle; eight sessions agree")
 
 

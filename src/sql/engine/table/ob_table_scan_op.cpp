@@ -26,6 +26,8 @@
 #include "sql/das/ob_das_vec_define.h"
 #include "share/geo/ob_geo_utils.h"
 #include "share/ob_ddl_checksum.h"
+#include "rootserver/ddl_task/ob_ddl_task.h"
+#include "common/ob_timeout_ctx.h"
 #include "share/geo/ob_srs_provider.h"
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
@@ -60,6 +62,112 @@ bool find_skip_delta_buffer_in_ctdef(const ObDASBaseCtDef *ctdef)
   }
   return found;
 }
+// Query metadata once per source operator, never per document. The proxy gets
+// its own internal SQL connection; nested/recursive executions opt out entirely.
+FTBuildShareIdentity get_fts_share_identity(ObExecContext &ctx,
+                                           const ObTableScanSpec &spec,
+                                           const ObDASScanRtDef &scan_rtdef)
+{
+  FTBuildShareIdentity id;
+  id.parser_name_ = spec.parser_name_;
+  id.parser_properties_ = spec.parser_properties_;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  const ObPhysicalPlan *plan = spec.plan_;
+  static thread_local bool reading_metadata = false;
+  if (!spec.is_fts_ddl_ || session == nullptr || plan == nullptr || GCTX.sql_proxy_ == nullptr
+      || ctx.get_nested_level() > 0 || session->is_nested_session() || reading_metadata
+      || ctx.get_sql_ctx() == nullptr || ctx.get_sql_ctx()->schema_guard_ == nullptr
+      || plan->get_ddl_task_id() <= 0 || plan->get_ddl_table_id() <= 0) { return id; }
+  struct ReadGuard {
+    bool &active_;
+    ReadGuard(bool &active) : active_(active) { active_ = true; }
+    ~ReadGuard() { active_ = false; }
+  } guard(reading_metadata);
+  const int64_t previous_timeout = ObTimeoutCtx::get_ctx().get_abs_timeout();
+  ObTimeoutCtx timeout;
+  const int64_t deadline = ObTimeUtility::current_time() + 200000;
+  if (OB_SUCCESS != timeout.set_abs_timeout(previous_timeout > 0 ? MIN(previous_timeout, deadline) : deadline)) { return id; }
+  ObArenaAllocator allocator(ObMemAttr("FTShareIdentity"));
+  rootserver::ObDDLTaskRecord child;
+  rootserver::ObDDLTaskRecord parent;
+  const ObTableSchema *aux = nullptr;
+  const ObTableSchema *base = nullptr;
+  auto *schema_guard = ctx.get_sql_ctx()->schema_guard_;
+  int64_t snapshot = 0;
+  if (scan_rtdef.fb_snapshot_.is_valid()) {
+    snapshot = scan_rtdef.fb_snapshot_.get_val_for_tx();
+  } else if (scan_rtdef.frozen_version_ > 0) {
+    snapshot = scan_rtdef.frozen_version_;
+  } else if (ctx.get_das_ctx().get_snapshot().is_valid()) {
+    snapshot = ctx.get_das_ctx().get_snapshot().version().get_val_for_tx();
+  }
+  // Every failure, including metadata SQL errors, disables only acceleration.
+  // Do not surface an optional metadata lookup as an index-build error.
+  int ret = rootserver::ObDDLTaskRecordOperator::get_ddl_task_record(
+      plan->get_ddl_task_id(), *GCTX.sql_proxy_, allocator, child);
+  LOG_INFO("fts share identity metadata", K(ret),
+           "plan_task", plan->get_ddl_task_id(), "plan_execution", plan->get_ddl_execution_id(),
+           "plan_table", plan->get_ddl_table_id(), "plan_schema", plan->get_ddl_schema_version(),
+           "child_execution", child.execution_id_, "child_table", child.target_object_id_,
+           "child_schema", child.schema_version_, "child_parent", child.parent_task_id_,
+           "child_object", child.object_id_, "source_table", spec.ref_table_id_,
+           "runtime_snapshot", snapshot, "child_snapshot", child.snapshot_version_);
+  if (ret != OB_SUCCESS || child.parent_task_id_ <= 0
+      || child.execution_id_ != plan->get_ddl_execution_id()
+      || child.target_object_id_ != static_cast<uint64_t>(plan->get_ddl_table_id())
+      || child.schema_version_ != static_cast<uint64_t>(plan->get_ddl_schema_version())
+      || child.snapshot_version_ <= 0 || snapshot != child.snapshot_version_
+      || child.object_id_ != spec.ref_table_id_) { return id; }
+  ret = rootserver::ObDDLTaskRecordOperator::get_ddl_task_record(
+      child.parent_task_id_, *GCTX.sql_proxy_, allocator, parent);
+  // An FTS parent coordinates child SQL builds and never starts its own SQL
+  // execution. Its persisted execution_id remains the ObDDLTask sentinel -1;
+  // preserve that exact value in the domain identity. Child epochs must still
+  // match their running physical plans exactly.
+  const int aux_ret = ret == OB_SUCCESS
+      ? schema_guard->get_table_schema(child.target_object_id_, aux) : OB_ENTRY_NOT_EXIST;
+  const int base_ret = ret == OB_SUCCESS
+      ? schema_guard->get_table_schema(child.object_id_, base) : OB_ENTRY_NOT_EXIST;
+  const char *reason = nullptr;
+  if (ret != OB_SUCCESS) { reason = "parent_record"; }
+  else if (parent.task_id_ != child.parent_task_id_) { reason = "parent_task"; }
+  else if (parent.ddl_type_ != ObDDLType::DDL_CREATE_FTS_INDEX) { reason = "parent_type"; }
+  else if (parent.object_id_ != child.object_id_) { reason = "parent_object"; }
+  else if (parent.execution_id_ < -1) { reason = "parent_execution"; }
+  else if (parent.target_object_id_ == OB_INVALID_ID) { reason = "parent_target"; }
+  else if (aux_ret != OB_SUCCESS || aux == nullptr) { reason = "aux_schema"; }
+  else if (aux->get_data_table_id() != child.object_id_) { reason = "aux_base"; }
+  else if (spec.is_fts_index_aux_ ? !aux->is_fts_index_aux() : !aux->is_fts_doc_word_aux()) { reason = "aux_role"; }
+  else if (base_ret != OB_SUCCESS || base == nullptr) { reason = "base_schema"; }
+  else if (base->is_partitioned_table() || aux->is_partitioned_table()) { reason = "partitioned"; }
+  else if (!base->get_tablet_id().is_valid()) { reason = "base_tablet"; }
+  LOG_INFO("fts share identity parent schema", "reason", reason == nullptr ? "valid" : reason,
+           K(ret), "child_task", child.task_id_, "parent_task", parent.task_id_,
+           "parent_type", static_cast<int64_t>(parent.ddl_type_),
+           "parent_execution", parent.execution_id_, "parent_object", parent.object_id_,
+           "parent_target", parent.target_object_id_, "child_object", child.object_id_,
+           K(aux_ret), "aux_base", aux == nullptr ? OB_INVALID_ID : aux->get_data_table_id(),
+           "aux_word_doc", aux != nullptr && aux->is_fts_index_aux(),
+           "aux_doc_word", aux != nullptr && aux->is_fts_doc_word_aux(), K(base_ret),
+           "base_partitioned", base != nullptr && base->is_partitioned_table(),
+           "aux_partitioned", aux != nullptr && aux->is_partitioned_table(),
+           "base_tablet", base == nullptr ? 0 : base->get_tablet_id().id(),
+           "source_schema", spec.tsc_ctdef_.scan_ctdef_.schema_version_);
+  if (reason != nullptr) { return id; }
+  id.tenant_id_ = 1; // This standalone engine has one process-wide DDL task namespace.
+  id.parent_task_id_ = parent.task_id_;
+  id.parent_execution_id_ = parent.execution_id_;
+  id.parent_index_id_ = parent.target_object_id_;
+  id.base_table_id_ = child.object_id_;
+  id.base_tablet_id_ = base->get_tablet_id().id();
+  id.base_schema_version_ = spec.tsc_ctdef_.scan_ctdef_.schema_version_;
+  id.child_task_id_ = child.task_id_;
+  id.child_execution_id_ = child.execution_id_;
+  id.aux_table_id_ = child.target_object_id_;
+  id.snapshot_version_ = child.snapshot_version_;
+  return id;
+}
+
 }  // anonymous namespace
 
 int SnapshotScanItem::set_snapshot_query_info(ObEvalCtx &eval_ctx, ObDASScanRtDef &scan_rtdef) const
@@ -1503,6 +1611,7 @@ int ObTableScanOp::inner_open()
 
 int ObTableScanOp::inner_close()
 {
+  fts_index_.disable_shared_parse();
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(scan_iter_)) {
     if (scan_iter_->has_task()) {
@@ -1534,10 +1643,22 @@ int ObTableScanOp::do_init_before_get_row()
         } else if (OB_FAIL(reassign_task_ranges(info))) {
         }
       }
+      auto open_source_scan = [&]() {
+        // Sample-to-real DDL scans use close_and_reopen(), which does not call
+        // inner_open(). Bind the lease to the real scan, after task assignment,
+        // so closing a sample cannot leave the materialization scan unbound.
+        if (MY_SPEC.is_fts_ddl_ && tsc_rtdef_.scan_rtdef_.sample_info_ == nullptr
+            && scan_iter_ != nullptr && scan_iter_->has_task()) {
+          fts_index_.enable_shared_parse(get_fts_share_identity(ctx_, MY_SPEC, tsc_rtdef_.scan_rtdef_));
+        }
+        const int rc = do_table_scan();
+        if (rc != OB_SUCCESS) { fts_index_.disable_shared_parse(); }
+        return rc;
+      };
       if (OB_FAIL(ret) || OB_UNLIKELY(iter_end_)) {
         // do nothing
       } else if (OB_FAIL(prepare_all_das_tasks())) {
-      } else if (OB_FAIL(do_table_scan())) {
+      } else if (OB_FAIL(open_source_scan())) {
         if (OB_TRY_LOCK_ROW_CONFLICT != ret) {
         }
       } else {
@@ -1556,6 +1677,9 @@ int ObTableScanOp::do_init_before_get_row()
 
 void ObTableScanOp::destroy()
 {
+  // Framework error teardown can destroy an operator whose open/scan failed
+  // before normal close. The optional lease cleanup is idempotent.
+  fts_index_.disable_shared_parse();
   tsc_rtdef_.~ObTableScanRtDef();
   ObOperator::destroy();
   if (OB_NOT_NULL(iter_tree_)) {

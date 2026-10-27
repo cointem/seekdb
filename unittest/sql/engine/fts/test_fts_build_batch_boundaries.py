@@ -88,6 +88,32 @@ def main():
                 for (row_id, score), (_, expected_score) in zip(actual, expected_rows):
                     assert math.isclose(score, expected_score, rel_tol=1e-10, abs_tol=1e-10), \
                         (query, row_id, score, expected_score)
+        # Exercise the encoder with near-maximum legal token payloads, many
+        # repeated posting keys across document IDs, and a partial final batch.
+        # Keep this corpus separate so existing DDL golden scores stay stable.
+        long_terms = ["payload" + chr(97 + i) + "x" * (56 + (i * 5) % 21)
+                      for i in range(17)]
+        payload_docs = {i: None if i % 29 == 0 else '' if i % 31 == 0 else
+                        'payloadmarker ' + ' '.join(long_terms[(i + j) % len(long_terms)]
+                                                   for j in range(4 + i % 3))
+                        for i in range(1, 274)}
+        sql(f'CREATE TABLE {database}.payload_built(id BIGINT PRIMARY KEY, body LONGTEXT);'
+            f'CREATE TABLE {database}.payload_reference(id BIGINT PRIMARY KEY, body LONGTEXT, '
+            f'FULLTEXT INDEX ft(body) WITH PARSER {args.parser});')
+        items = list(payload_docs.items())
+        for start in range(0, len(items), 64):
+            values = ','.join(f'({i},{literal(body)})' for i, body in items[start:start + 64])
+            sql(f'INSERT INTO {database}.payload_built VALUES {values};'
+                f'INSERT INTO {database}.payload_reference VALUES {values};')
+        sql(f'CREATE FULLTEXT INDEX ft ON {database}.payload_built(body) WITH PARSER {args.parser};')
+        for query in ('payloadmarker', long_terms[0], long_terms[8], long_terms[-1],
+                      long_terms[0] + ' ' + long_terms[-1], 'absentpayloadmarker'):
+            terms = set(query.split())
+            expected_ids = [i for i, body in payload_docs.items() if body and terms.intersection(body.split())]
+            for table in ('payload_built', 'payload_reference'):
+                match = f'MATCH(body) AGAINST({literal(query)})'
+                actual_ids = sql(f'SELECT id FROM {database}.{table} WHERE {match}>0 ORDER BY id;')
+                assert actual_ids.splitlines() == [str(i) for i in expected_ids], (table, query, actual_ids)
         print(f'PASS {args.parser}: short/NULL/empty/long/final FTS batch membership'
               + (' and golden DDL scores' if args.compare else ''))
     finally:

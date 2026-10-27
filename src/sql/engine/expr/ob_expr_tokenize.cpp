@@ -724,18 +724,39 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
-  storage::ObDicLoaderHandle dic_loader_handle;
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
-  } else if (need_to_load_dic) {
-    if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
-                    ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
-                    dic_loader_handle))) {
-    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+  } else if (!need_to_load_dic) {
+    dictionary_loader_.reset();
+    dictionary_charset_ = CHARSET_INVALID;
+    dictionary_generation_ = 0;
+  } else {
+    const ObCharsetType charset = ObCharset::charset_type_by_coll(meta_.get_collation_type());
+    const uint64_t generation = storage::ObFTParseData::instance().generation();
+    if (dictionary_charset_ != charset || dictionary_generation_ != generation) {
+      dictionary_loader_.reset();
     }
+    if (!dictionary_loader_.is_valid()) {
+      if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
+                      ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK),
+                      charset, dictionary_loader_))) {
+      } else {
+        dictionary_charset_ = charset;
+        dictionary_generation_ = generation;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(!dictionary_loader_.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(dictionary_loader_.get_loader()->try_load_dictionary_in_trans())) {
+    }
+  }
+  // A failed parser check, lookup or load must not retain a ready identity.
+  // Retry the normal registry and transaction checks on the next invocation.
+  if (OB_FAIL(ret)) {
+    dictionary_loader_.reset();
+    dictionary_charset_ = CHARSET_INVALID;
+    dictionary_generation_ = 0;
   }
   return ret;
 }

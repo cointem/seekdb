@@ -30,6 +30,7 @@ void ObBatchDatumRows::reset()
   trans_id_.reset();
   vectors_.reset();
   row_count_ = 0;
+  fts_bulk_load_ = false;
 }
 
 int ObBatchDatumRows::to_datum_row(int64_t idx, ObDatumRow &datum_row) const {

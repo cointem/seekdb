@@ -70,6 +70,8 @@ public:
   int init(const ObMicroBlockEncodingCtx &ctx);
   // return OB_BUF_NOT_ENOUGH if exceed micro block size
   virtual int append_row(const ObDatumRow &row) override;
+  virtual int append_fts_batch(const ObBatchDatumRows &batch,
+                               const int64_t start, const int64_t row_count) override;
   virtual int build_block(char *&buf, int64_t &size) override;
   // clear status and release memory, reset along with macro block writer
   virtual void reset() override;

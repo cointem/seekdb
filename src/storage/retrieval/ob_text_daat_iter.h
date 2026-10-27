@@ -57,7 +57,7 @@ public:
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
       function_lookup_mode_(false), hit_union_enabled_(false), hit_union_inited_(false),
-      hit_id_cmp_(nullptr), count_only_(false), count_binary_ids_(false), count_exhausted_(0) {}
+      hit_id_cmp_(nullptr), count_only_(false), count_binary_ids_(false), packed_count_enabled_(false), count_exhausted_(0) {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
@@ -68,6 +68,8 @@ protected:
   virtual int pre_process() override;
 private:
   int get_next_count_rows(const int64_t capacity, int64_t &count);
+  template <int N>
+  int get_next_packed_count_rows(const int64_t capacity, int64_t &count);
   int compare_count_ids(const ObDatum &left, const ObDatum &right, int &cmp) const;
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
@@ -78,6 +80,7 @@ protected:
   common::ObDatumCmpFuncType hit_id_cmp_;
   bool count_only_;
   bool count_binary_ids_;
+  bool packed_count_enabled_;
   uint64_t count_exhausted_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);

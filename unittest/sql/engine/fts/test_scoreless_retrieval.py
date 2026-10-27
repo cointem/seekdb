@@ -23,7 +23,17 @@ def main():
     def sql(statement):
         statement = statement.replace("fts_scoreless_test", database)
         result = subprocess.run(command, input="SET NAMES utf8mb4; SET group_concat_max_len=1000000; " + statement,
-                                text=True, capture_output=True, check=True)
+                                text=True, capture_output=True)
+        if result.returncode:
+            # Batched SELECT failures must expose the server error as well as
+            # the input; CalledProcessError alone drops captured stderr.
+            sql_context = statement if len(statement) <= 16000 else (
+                statement[:12000] + f"\n... [{len(statement) - 16000} SQL characters omitted] ...\n"
+                + statement[-4000:])
+            raise RuntimeError(
+                f"SQL client exited {result.returncode}; completed output lines={len(result.stdout.splitlines())}\n"
+                f"stderr:\n{result.stderr or '(empty)'}\n"
+                f"stdout tail:\n{result.stdout[-2000:]}\nSQL:\n{sql_context}")
         return result.stdout.strip()
 
     def literal(value):
@@ -124,7 +134,8 @@ def main():
 
     def verify_count_sink():
         for rowset in (1, 7, 256):
-            for query in ("", "absentword", "alpha", "alpha alpha bravo", " ".join(words)):
+            for query in ("", "absentword", "alpha", "alpha alpha bravo", "alpha bravo charlie",
+                          "alpha absentword", "alpha bravo absentword", " ".join(words)):
                 expected = sum(bool(set(query.split()).intersection(tokens)) for tokens in docs.values())
                 prefix = f"SELECT /*+ OPT_PARAM('rowsets_max_rows', {rowset}) */ COUNT(*) FROM fts_scoreless_test.docs WHERE "
                 actual = sql(prefix + match(query))
@@ -190,13 +201,27 @@ def main():
             statements = []
             expected = []
             hint = f"/*+ OPT_PARAM('rowsets_max_rows', {rowset}) */ "
-            for query in ("absentword", "alpha", "alpha alpha bravo", "foxtrot hotel", "alpha bravo charlie delta echo foxtrot hotel"):
+            # Two/three packed lanes include fully equal streams, an exhausted
+            # lane, partial overlaps and unequal tail batches. The scored path
+            # supplies an independent oracle before and after DML visibility changes.
+            for query in ("absentword", "alpha", "alpha alpha bravo", "foxtrot hotel",
+                          "alpha bravo charlie", "alpha absentword", "alpha bravo absentword",
+                          "foxtrot hotel absentword", "alpha bravo charlie delta echo foxtrot hotel"):
                 hits = sum(bool(set(query.split()).intersection(tokens)) for tokens in run_docs.values())
                 for scored in (False, True):
                     predicate = match(query) + (" > 0" if scored else "")
                     statements.append("SELECT " + hint + "COUNT(*) FROM fts_scoreless_test.runs WHERE " + predicate)
                     expected.append(str(hits))
-                    for limit, offset in ((0, 0), (1, 0), (20, 15), (20, 16), (20, 255), (20, 256), (257, 255), (20, 511), (20, 1000)):
+                    boundaries = ((0, 0), (1, 0), (20, 15), (20, 16), (20, 255),
+                                  (20, 256), (257, 255), (20, 511), (20, 1000),
+                                  (20, 9223372036854775787), (1, 9223372036854775806))
+                    # Generic scored Top-N rejects LIMIT+OFFSET > INT64_MAX
+                    # (also verified on the 7ded control). Compare both paths at
+                    # the legal sum boundary; exercise saturated COUNT demand
+                    # separately against the known finite-corpus cardinality.
+                    if not scored:
+                        boundaries += ((20, 9223372036854775807),)
+                    for limit, offset in boundaries:
                         statements.append("SELECT COUNT(*) FROM (SELECT " + hint + "id FROM fts_scoreless_test.runs WHERE "
                                           + predicate + f" LIMIT {limit} OFFSET {offset}) limited")
                         expected.append(str(min(limit, max(hits - offset, 0))))

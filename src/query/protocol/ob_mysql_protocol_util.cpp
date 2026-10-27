@@ -462,18 +462,29 @@ int ObSMUtils::build_cell_value(const ObObj &obj, MYSQL_PROTOCOL_TYPE type,
       } else if (OB_UNLIKELY(value.length() < 0 || NULL == value.ptr())) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        lib::ObMemAttr mem_attr("JsonAlloc");
-        ObArenaAllocator allocator(mem_attr);
-        ObJsonBin json_bin(value.ptr(), value.length(), &allocator);
+        // Cell views remain live until the caller encodes the row. Print into
+        // that same scratch lifetime instead of a temporary arena followed by
+        // a second complete copy of the JSON text.
+        ObJsonBin json_bin(value.ptr(), value.length(), &scratch_allocator);
         ObIJsonBase *json_base = &json_bin;
-        ObJsonBuffer json_buf(&allocator);
+        ObJsonBuffer json_buf(&scratch_allocator);
         json_bin.set_seek_flag(true);
         if (OB_FAIL(json_bin.reset_iter())) {
         } else if (OB_FAIL(json_base->print(json_buf, true, value.length()))) {
-        } else {
+        } else if (json_buf.length() <= ObMySQLCellValue::LOCAL_BUFFER_SIZE
+                   || json_buf.capacity() > INT32_MAX) {
+          // Keep inline cells inline. ObString's detach interface has 32-bit
+          // capacity, so retain the existing copy path for larger buffers.
           ret = set_copied_bytes(scratch_allocator,
                                  ObMySQLCellValueKind::LENENC_BYTES,
                                  json_buf.ptr(), json_buf.length(), out);
+        } else {
+          ObString text;
+          if (OB_FAIL(json_buf.get_result_string(text))) {
+          } else {
+            out.set_borrowed_bytes(ObMySQLCellValueKind::LENENC_BYTES,
+                                   text.ptr(), text.length());
+          }
         }
       }
       break;

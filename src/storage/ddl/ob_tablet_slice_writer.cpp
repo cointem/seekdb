@@ -776,10 +776,9 @@ int ObBatchSliceWriter::append_current_batch(const ObIArray<ObIVector *> &vector
     // The ordered datum-batch caller retains the input through this call.
     // Write its vectors synchronously instead of copying every term into the
     // row buffer. MVCC constants and validation match flush_row_buffer().
-    // For this fixed-snapshot/SQL-sequence-zero FTS stream, the public macro
-    // append_batch calls append_row_inner for every row, retaining the original
-    // row writer's order/duplicate checks and owned last key across batches.
-    // Do not also run check_order here and compare every posting twice.
+    // The explicit tag permits supported encoders to copy the FTS columns in
+    // bulk. The macro writer retains order/MVCC validation and owns its last key;
+    // unsupported shapes and micro-block boundaries use the original row path.
     ObBatchDatumRows borrowed_rows;
     const int64_t mv_count = ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
     for (int64_t i = 0; OB_SUCC(ret) && i < buffer_batch_rows_.vectors_.count(); ++i) {
@@ -790,6 +789,7 @@ int ObBatchSliceWriter::append_current_batch(const ObIArray<ObIVector *> &vector
       }
     }
     borrowed_rows.row_count_ = selector.size();
+    borrowed_rows.fts_bulk_load_ = true;
     borrowed_rows.row_flag_ = ObDmlFlag::DF_INSERT;
     const ObDDLTableSchema &schema = writer_param_.ddl_table_schema_;
     if (OB_FAIL(ret)) {

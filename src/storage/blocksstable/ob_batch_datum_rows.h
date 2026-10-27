@@ -30,7 +30,7 @@ class ObBatchDatumRows
 {
 public:
   ObBatchDatumRows() 
-    : row_count_(0) 
+    : row_count_(0), fts_bulk_load_(false)
   {
     
   }
@@ -52,6 +52,9 @@ public:
   transaction::ObTransID trans_id_;
   common::ObArray<common::ObIVector *> vectors_;
   int64_t row_count_;
+  // Explicitly set only by the synchronous FTS bulk-load borrowed-input path.
+  // Layout alone never opts an ordinary table into specialized encoding.
+  bool fts_bulk_load_;
 };
 
 } // namespace blocksstable

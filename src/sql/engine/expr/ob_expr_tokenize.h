@@ -23,6 +23,7 @@
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "data_plane/fts/ob_fts_parser_name.h"
+#include "data_plane/fts/dict/ob_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "common/json_type/ob_json_tree.h"
 
@@ -78,6 +79,10 @@ private:
     storage::ObFTParserProperty parsed_properties_;
     ObObjMeta meta_;
     ObString fulltext_;
+    // A context lease pins its immutable loader identity, never document results.
+    storage::ObDicLoaderHandle dictionary_loader_;
+    ObCharsetType dictionary_charset_ = CHARSET_INVALID;
+    uint64_t dictionary_generation_ = 0;
     enum OUTPUT_MODE
     {
       DEFAULT,

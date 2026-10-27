@@ -413,6 +413,9 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     count_(0),
     relevance_(),
     doc_id_(),
+    count_doc_ids_(nullptr),
+    prefer_count_doc_ids_(false),
+    packed_count_batch_(false),
     cmp_func_(nullptr),
     is_inited_(false)
 {
@@ -440,11 +443,9 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
-      } else if (OB_FAIL(relevance_.init(max_batch_size_))) {
-      } else if (OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
+      } else if (nullptr != relevance_expr_ && OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
       } else if (FALSE_IT(doc_id_.set_allocator(allocator_))) {
-      } else if (OB_FAIL(doc_id_.init(max_batch_size_))) {
-      } else if (OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
+      } else if (nullptr != relevance_expr_ && OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
       } else {
         is_inited_ = true;
       }
@@ -455,6 +456,8 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
 
 void ObTextRetrievalDaaTTokenIter::reuse()
 {
+  prefer_count_doc_ids_ = false;
+  packed_count_batch_ = false;
   cur_idx_ = -1;
   count_ = 0;
   token_iter_->reuse();
@@ -462,6 +465,12 @@ void ObTextRetrievalDaaTTokenIter::reuse()
 
 void ObTextRetrievalDaaTTokenIter::reset()
 {
+  if (nullptr != count_doc_ids_) {
+    allocator_->free(count_doc_ids_);
+    count_doc_ids_ = nullptr;
+  }
+  prefer_count_doc_ids_ = false;
+  packed_count_batch_ = false;
   relevance_.reset();
   doc_id_.reset();
   token_iter_->reset();
@@ -508,9 +517,11 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
 
 int ObTextRetrievalDaaTTokenIter::save_docids()
 {
+  packed_count_batch_ = false;
   int ret = OB_SUCCESS;
   if (OB_ISNULL(inv_scan_domain_id_col_)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (0 == doc_id_.count() && OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
   } else {
     cur_idx_ = 0;
     int64_t visible_count = 0;
@@ -524,6 +535,80 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
       }
     }
     count_ = visible_count;
+  }
+  return ret;
+}
+
+int ObTextRetrievalDaaTTokenIter::save_count_docids()
+{
+  int ret = OB_SUCCESS;
+  packed_count_batch_ = false;
+  // Empty/exhausted posting lists never allocate a packed column.
+  if (nullptr == count_doc_ids_) {
+    count_doc_ids_ = static_cast<CountDocId16 *>(allocator_->alloc(
+        sizeof(CountDocId16) * max_batch_size_));
+    if (nullptr == count_doc_ids_) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  int64_t visible_count = 0;
+  const ObDatumVector &datums = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+  for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
+    if (!token_iter_->get_skip()->at(i)) {
+      const ObDatum &datum = *datums.at(i);
+      if (datum.is_null() || datum.len_ != sizeof(CountDocId16)) {
+        // Preserve comparator/NULL semantics for an unexpected representation.
+        // No cursor has consumed this batch, so the original frame is intact.
+        return save_docids();
+      }
+      MEMCPY(count_doc_ids_[visible_count++].bytes_, datum.ptr_, sizeof(CountDocId16));
+    }
+  }
+  cur_idx_ = 0;
+  count_ = visible_count;
+  packed_count_batch_ = true;
+  return ret;
+}
+
+int ObTextRetrievalDaaTTokenIter::materialize_count_docids()
+{
+  int ret = OB_SUCCESS;
+  if (packed_count_batch_) {
+    if (0 == doc_id_.count() && OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
+      ObDatum datum;
+      datum.set_string(count_doc_ids_[i].bytes_, sizeof(CountDocId16));
+      ret = doc_id_[i].from_datum(datum);
+    }
+    if (OB_SUCC(ret)) {
+      packed_count_batch_ = false;
+    }
+  }
+  // A generic consumer must continue producing ObDocIdExt batches after fallback.
+  prefer_count_doc_ids_ = false;
+  return ret;
+}
+
+int ObTextRetrievalDaaTTokenIter::peek_count_doc_id_run(
+    const CountDocId16 *&ids, int64_t &count, const int64_t capacity, bool &packed)
+{
+  int ret = OB_SUCCESS;
+  ids = nullptr;
+  count = 0;
+  packed = false;
+  if (OB_SUCC(ret) && (cur_idx_ < 0 || cur_idx_ >= count_)) {
+    prefer_count_doc_ids_ = true;
+    int64_t loaded = 0;
+    ret = get_next_batch(MIN(capacity, max_batch_size_), loaded);
+  }
+  if (OB_SUCC(ret) && packed_count_batch_) {
+    ids = count_doc_ids_ + cur_idx_;
+    count = count_ - cur_idx_;
+    packed = true;
   }
   return ret;
 }
@@ -551,7 +636,8 @@ int ObTextRetrievalDaaTTokenIter::get_next_batch(const int64_t capacity, int64_t
         ret = OB_SUCCESS;
       }
       if (OB_SUCC(ret) && count_ > 0) {
-        ret = nullptr != relevance_expr_ ? save_relevances_and_docids() : save_docids();
+        ret = nullptr != relevance_expr_ ? save_relevances_and_docids()
+            : (prefer_count_doc_ids_ ? save_count_docids() : save_docids());
       }
     } while (OB_SUCC(ret) && count_ == 0);
     count = count_;

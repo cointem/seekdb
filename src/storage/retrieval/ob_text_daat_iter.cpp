@@ -50,6 +50,8 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
     if (hit_union_enabled_) {
       const ObDatumMeta &id_meta = iter_param_->id_proj_expr_->datum_meta_;
       count_binary_ids_ = common::ObVarcharType == id_meta.type_ && CS_TYPE_BINARY == id_meta.cs_type_;
+      packed_count_enabled_ = count_only_ && count_binary_ids_
+          && (2 == dim_iters_->count() || 3 == dim_iters_->count());
       auto *funcs = ObDatumFuncs::get_basic_func(iter_param_->id_proj_expr_->datum_meta_.type_,
           iter_param_->id_proj_expr_->datum_meta_.cs_type_);
       hit_id_cmp_ = funcs->null_first_cmp_;
@@ -149,6 +151,177 @@ int ObTextDaaTIter::compare_count_ids(const ObDatum &left, const ObDatum &right,
   return ret;
 }
 
+namespace
+{
+// The first key is already strictly below boundary. Preserve v6's run skip
+// for disjoint ranges while comparing packed bytes instead of wrapped datums.
+int64_t packed_count_prefix(const CountDocId16 *ids, const int64_t size,
+                            const CountDocId16 *boundary)
+{
+  int64_t low = 1;
+  int64_t high = MIN(2L, size);
+  while (low < size) {
+    const int64_t probe = high - 1;
+    if (MEMCMP(ids[probe].bytes_, boundary->bytes_, 16) >= 0) {
+      high = probe;
+      break;
+    }
+    low = probe + 1;
+    high = MIN(size, high * 2);
+  }
+  while (low < high) {
+    const int64_t mid = low + (high - low) / 2;
+    if (MEMCMP(ids[mid].bytes_, boundary->bytes_, 16) < 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+} // namespace
+
+// Fixed two/three-way COUNT kernels keep owned packed batch pointers in local
+// variables. Storage is still responsible for visibility and per-token uniqueness.
+// Return cursors only at a refill/output boundary, never per posting.
+template <int N>
+int ObTextDaaTIter::get_next_packed_count_rows(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  const common::ObLimitParam &limit = *iter_param_->limit_param_;
+  ObTextRetrievalDaaTTokenIter *iters[N];
+  for (int i = 0; i < N; ++i) {
+    iters[i] = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i));
+  }
+  while (OB_SUCC(ret) && packed_count_enabled_ && count < capacity) {
+    const CountDocId16 *begin[N] = {};
+    const CountDocId16 *pos[N] = {};
+    const CountDocId16 *end[N] = {};
+    unsigned active = 0;
+    for (int i = 0; OB_SUCC(ret) && packed_count_enabled_ && i < N; ++i) {
+      if (0 == (count_exhausted_ & (1ULL << i))) {
+        int64_t size = 0;
+        bool packed = false;
+        ret = iters[i]->peek_count_doc_id_run(begin[i], size, capacity, packed);
+        if (OB_ITER_END == ret) {
+          count_exhausted_ |= 1ULL << i;
+          ret = OB_SUCCESS;
+        } else if (OB_SUCC(ret) && !packed) {
+          packed_count_enabled_ = false;
+        } else if (OB_SUCC(ret)) {
+          pos[i] = begin[i];
+          end[i] = begin[i] + size;
+          active |= 1U << i;
+        }
+      }
+    }
+    if (OB_FAIL(ret) || !packed_count_enabled_) {
+      // No local pointers have been consumed, so every lane can fall back.
+    } else if (0 == active) {
+      ret = OB_ITER_END;
+    } else {
+      const int64_t offset = limit.is_valid() && input_row_cnt_ < limit.offset_
+          ? limit.offset_ - input_row_cnt_ : 0;
+      int64_t demand = capacity - count;
+      if (limit.is_valid()) {
+        demand = MIN(demand, limit.limit_ - output_row_cnt_);
+      }
+      demand = offset > INT64_MAX - demand ? INT64_MAX : demand + offset;
+      int64_t merged = 0;
+      if (0 == (active & (active - 1))) {
+        // A single remaining token is already unique after MVCC filtering.
+        const int lane = __builtin_ctz(active);
+        merged = MIN(demand, end[lane] - pos[lane]);
+        pos[lane] += merged;
+      } else {
+        while (merged < demand) {
+          // N is a compile-time constant; two lanes need one comparison,
+          // and three lanes need two. There is no generic eight-lane search.
+          int first = 0 != (active & 1U) ? 0 : 1;
+          unsigned winners = 1U << first;
+          if (0 != (active & 2U) && first != 1) {
+            const int cmp = MEMCMP(pos[1]->bytes_, pos[first]->bytes_, 16);
+            if (cmp < 0) {
+              first = 1;
+              winners = 2U;
+            } else if (0 == cmp) {
+              winners |= 2U;
+            }
+          }
+          if (N == 3 && 0 != (active & 4U)) {
+            const int cmp = MEMCMP(pos[2]->bytes_, pos[first]->bytes_, 16);
+            if (cmp < 0) {
+              first = 2;
+              winners = 4U;
+            } else if (0 == cmp) {
+              winners |= 4U;
+            }
+          }
+          int64_t step = 1;
+          if (0 == (winners & (winners - 1))) {
+            const CountDocId16 *boundary = nullptr;
+            for (int i = 0; i < N; ++i) {
+              if (i != first && 0 != (active & (1U << i))
+                  && (nullptr == boundary || MEMCMP(pos[i]->bytes_, boundary->bytes_, 16) < 0)) {
+                boundary = pos[i];
+              }
+            }
+            step = packed_count_prefix(pos[first],
+                MIN(demand - merged, end[first] - pos[first]), boundary);
+          } else if (winners == active) {
+            int64_t common = demand - merged;
+            for (int i = 0; i < N; ++i) {
+              if (0 != (active & (1U << i))) {
+                common = MIN(common, end[i] - pos[i]);
+              }
+            }
+            bool equal = true;
+            while (equal && step < common) {
+              for (int i = 0; equal && i < N; ++i) {
+                if (i != first && 0 != (active & (1U << i))) {
+                  equal = 0 == MEMCMP(pos[first][step].bytes_, pos[i][step].bytes_, 16);
+                }
+              }
+              step += equal;
+            }
+          }
+          bool refill = false;
+          if (0 != (winners & 1U)) {
+            pos[0] += step;
+            refill = pos[0] == end[0];
+          }
+          if (0 != (winners & 2U)) {
+            pos[1] += step;
+            refill = (pos[1] == end[1]) || refill;
+          }
+          if (N == 3 && 0 != (winners & 4U)) {
+            pos[2] += step;
+            refill = (pos[2] == end[2]) || refill;
+          }
+          merged += step;
+          if (refill) {
+            break;
+          }
+        }
+      }
+      for (int i = 0; i < N; ++i) {
+        if (0 != (active & (1U << i))) {
+          iters[i]->consume_doc_id_run(pos[i] - begin[i]);
+        }
+      }
+      const int64_t skipped = MIN(offset, merged);
+      const int64_t emitted = merged - skipped;
+      input_row_cnt_ += merged;
+      output_row_cnt_ += emitted;
+      count += emitted;
+      if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+        ret = OB_ITER_END;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTextDaaTIter::get_next_count_rows(const int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
@@ -163,7 +336,14 @@ int ObTextDaaTIter::get_next_count_rows(const int64_t capacity, int64_t &count)
     ret = OB_ITER_END;
   } else {
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
-    while (OB_SUCC(ret) && count < real_capacity) {
+    if (packed_count_enabled_) {
+      ret = 2 == dim_iters_->count()
+          ? get_next_packed_count_rows<2>(real_capacity, count)
+          : get_next_packed_count_rows<3>(real_capacity, count);
+    }
+    // The packed kernel can encounter a non-16-byte/NULL batch after consuming
+    // earlier batches. Continue the generic cursor from exactly that position.
+    while (OB_SUCC(ret) && !packed_count_enabled_ && count < real_capacity) {
       const ObDocIdExt *runs[8] = {};
       int64_t sizes[8] = {};
       int64_t first = -1;
@@ -302,6 +482,7 @@ void ObTextDaaTIter::reset()
 {
   count_only_ = false;
   count_binary_ids_ = false;
+  packed_count_enabled_ = false;
   count_exhausted_ = 0;
   hit_union_enabled_ = false;
   hit_union_inited_ = false;
@@ -320,6 +501,8 @@ void ObTextDaaTIter::reuse(const bool switch_tablet)
 {
   hit_union_inited_ = false;
   count_exhausted_ = 0;
+  packed_count_enabled_ = count_only_ && count_binary_ids_ && nullptr != dim_iters_
+      && (2 == dim_iters_->count() || 3 == dim_iters_->count());
   if ((OB_NOT_NULL(dim_iters_) && 0 == dim_iters_->count())) {
     // do nothing
   } else {

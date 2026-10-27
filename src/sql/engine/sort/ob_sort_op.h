@@ -140,6 +140,7 @@ private:
   int process_sort_batch();
   int scan_all_then_sort();
   int scan_all_then_sort_batch();
+  int scan_all_then_sort_fts_batch();
   int init_prefix_sort(int64_t row_count,
                        bool is_batch,
                        int64_t topn_cnt = INT64_MAX);

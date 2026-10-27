@@ -245,6 +245,7 @@ private:
   int init_pre_warmer(const share::ObPreWarmerParam &pre_warm_param);
   int data_aggregator_eval(const ObBatchDatumRows &datum_rows, const int64_t start, const int64_t write_row_count);
   int append_row_inner(const ObDatumRow &row, const ObMacroBlockDesc *curr_macro_desc);
+  int try_append_fts_batch(const ObBatchDatumRows &rows, bool &appended);
   int append_row(const ObDatumRow &row, const int64_t split_size);
   int append_batch(const ObBatchDatumRows &datum_rows,
                    const int64_t split_size);
@@ -345,6 +346,10 @@ private:
   ObIMacroBlockValidator *validator_;
   ObDefaultMacroBlockFlusher default_macro_flusher_;
   ObSmallSStableMacroBlockFlusher small_sstable_macro_flusher_;
+  int64_t fts_batch_rows_;
+  int64_t fts_batch_fallbacks_;
+  int64_t fts_batch_buf_fallbacks_;
+  bool fts_batch_summary_logged_;
 };
 
 struct ObIMacroBlockValidator
