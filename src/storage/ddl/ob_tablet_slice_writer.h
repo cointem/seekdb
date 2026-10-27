@@ -270,12 +270,13 @@ public:
            const bool direct_write_macro_block,
            const bool is_append_batch,
            const int64_t max_batch_size,
-           query::ObISpillBatchSpoolFactory &spool_factory);
+           query::ObISpillBatchSpoolFactory &spool_factory,
+           bool borrow_batch_input = false);
   virtual int append_current_row(const ObIArray<ObDatum *> &datums);
   virtual int append_current_batch(const ObIArray<ObIVector *> &vectors, share::ObBatchSelector &selector);
   virtual int64_t get_row_count() const override { return row_buffer_.size() + (OB_NOT_NULL(storage_slice_writer_) ? storage_slice_writer_->get_row_count() : 0); }
   virtual int close();
-  INHERIT_TO_STRING_KV("RowStoreSliceWriter", ObRsSliceWriter, K(need_convert_storage_value_), K(direct_write_macro_block_), K(row_buffer_size_), K(row_buffer_.size()));
+  INHERIT_TO_STRING_KV("RowStoreSliceWriter", ObRsSliceWriter, K(need_convert_storage_value_), K(direct_write_macro_block_), K(borrow_batch_input_), K(row_buffer_size_), K(row_buffer_.size()));
 
 protected:
   int convert_to_storage_vector(ObIArray<ObIVector *> &vectors, share::ObBatchSelector &selector);
@@ -289,6 +290,7 @@ protected:
   ObArenaAllocator arena_;
   bool need_convert_storage_value_;
   bool direct_write_macro_block_;
+  bool borrow_batch_input_;
   int64_t row_buffer_size_;
   ObDDLBatchRows row_buffer_;
   blocksstable::ObBatchDatumRows buffer_batch_rows_;

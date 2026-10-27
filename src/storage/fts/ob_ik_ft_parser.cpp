@@ -71,7 +71,7 @@ void ObIKFTParser::clear_document()
 {
   arbitrator_.reuse();
   if (nullptr != ctx_) {
-    ctx_->reset_resource();
+    ctx_->release_document();
   }
   for (ObIIKProcessor *segmenter : segmenters_) {
     segmenter->reuse();

@@ -47,6 +47,12 @@ public:
   int init(ObFTParserParam *param);
   int restart(ObFTParserParam *param);
   void reset();
+  void clear_document()
+  {
+    if (nullptr != token_stream_) { token_stream_->reuse(); }
+    doc_.reset();
+    output_allocator_ = nullptr;
+  }
   virtual int get_next_token(
       const char *&word,
       int64_t &word_len,

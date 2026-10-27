@@ -33,6 +33,36 @@ namespace sql
 {
 
 
+// One generated posting in a batch-owned staging area. Integer values stay
+// inline; strings are copied before the source scan can reuse its row buffers.
+struct FTBuildBatchRow
+{
+  ObDatum word_;
+  ObDatum doc_id_;
+  uint64_t word_count_;
+  uint64_t doc_length_;
+};
+
+// Validated identity supplied once by the DDL scan. Snapshot is deliberately
+// per-reader: only immutable builtin pure-parse material may cross snapshots.
+struct FTBuildShareIdentity
+{
+  uint64_t tenant_id_ = 0;
+  int64_t parent_task_id_ = 0;
+  int64_t parent_execution_id_ = 0;
+  uint64_t parent_index_id_ = 0;
+  uint64_t base_table_id_ = 0;
+  uint64_t base_tablet_id_ = 0;
+  int64_t base_schema_version_ = 0;
+  int64_t child_task_id_ = 0;
+  int64_t child_execution_id_ = 0;
+  uint64_t aux_table_id_ = 0;
+  int64_t snapshot_version_ = 0;
+  common::ObString parser_name_;
+  common::ObString parser_properties_;
+};
+class FTBuildSharedDomain;
+
 class ObFTIndexRowCache final
 {
 public:
@@ -48,16 +78,27 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
   int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext);
+  // Optional acceleration: allocation/identity failures never fail the scan.
+  void enable_shared_parse(const FTBuildShareIdentity &identity);
+  void disable_shared_parse();
   int get_next_row(blocksstable::ObDatumRow *&row);
-  // Borrows term bytes until segment()/reuse(); never crosses a document.
-  int get_next_batch(ObDatum *columns[4], int64_t capacity, int64_t &count);
-  bool has_next() const { return row_idx_ < words_.size(); }
+  int begin_batch(int64_t capacity, FTBuildBatchRow *&rows);
+  // Appends the current document without invalidating earlier documents.
+  // A byte limit can end the batch before capacity; the word cursor is retained.
+  int append_batch(FTBuildBatchRow *rows, int64_t capacity, int64_t &count,
+                   int64_t &token_bytes, bool &full);
+  bool has_next() const { return row_idx_ < current_word_count(); }
   void reset();
   void reuse();
   TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited),
-               "row_count", words_.size());
+               "row_count", current_word_count());
 private:
+  int64_t current_word_count() const { return shared_entry_ != nullptr ? shared_row_count_ : words_.size(); }
+  ObDatum current_word() const;
+  int64_t current_frequency() const;
+  void advance_word();
   lib::MemoryContext merge_memctx_;
+  lib::MemoryContext batch_memctx_;
   storage::ObFTWordMap words_;
   storage::ObFTWordMap::const_iterator word_iter_;
   blocksstable::ObDatumRow current_row_;
@@ -68,6 +109,20 @@ private:
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;
   bool is_inited_;
+  FTBuildSharedDomain *shared_domain_ = nullptr;
+  void *shared_entry_ = nullptr; // pinned until this document has been drained
+  int64_t shared_row_count_ = 0;
+  bool share_attempted_ = false;
+  int64_t share_hits_ = 0;
+  int64_t share_misses_ = 0;
+  int64_t share_fallbacks_ = 0;
+  int64_t share_waits_ = 0;
+  int64_t share_bytes_ = 0;
+  char share_parser_[storage::OB_FT_PARSER_NAME_LENGTH] = {};
+  int64_t share_parent_task_ = 0;
+  int64_t share_child_task_ = 0;
+  int64_t share_snapshot_ = 0;
+  int64_t share_base_schema_ = 0;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
 };

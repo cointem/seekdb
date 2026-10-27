@@ -23,6 +23,9 @@
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "data_plane/fts/ob_fts_parser_name.h"
+#include "data_plane/fts/dict/ob_dic_loader.h"
+#include "data_plane/fts/ob_fts_parser_helper.h"
+#include "common/json_type/ob_json_tree.h"
 
 namespace oceanbase
 {
@@ -76,12 +79,61 @@ private:
     storage::ObFTParserProperty parsed_properties_;
     ObObjMeta meta_;
     ObString fulltext_;
+    // A context lease pins its immutable loader identity, never document results.
+    storage::ObDicLoaderHandle dictionary_loader_;
+    ObCharsetType dictionary_charset_ = CHARSET_INVALID;
+    uint64_t dictionary_generation_ = 0;
     enum OUTPUT_MODE
     {
       DEFAULT,
       ALL,
     } output_mode_;
   };
+
+private:
+  // A private lease owns this state; it contains configuration, never text results.
+  class TokenizeContext
+  {
+  public:
+    TokenizeContext() : document_allocator_("TokenizeDoc"), configured_(false),
+        json_allocator_("TokenizeJson"), token_array_(&json_allocator_) {}
+    ~TokenizeContext() = default;
+    int make_token_array_json(common::ObIJsonBase *&result);
+    void clear_document()
+    {
+      token_array_.clear();
+      for (int64_t i = 0; i < token_count_; ++i) {
+        token_nodes_[i].set_value(nullptr, 0);
+        token_nodes_[i].set_parent(nullptr);
+      }
+      token_count_ = 0;
+      words_.reuse(); // Drop keys before releasing their backing strings.
+      if (document_allocator_.total() > 1024 * 1024) {
+        document_allocator_.reset();
+      } else {
+        document_allocator_.reuse();
+      }
+      param_.fulltext_.reset();
+    }
+    TokenizeParam param_;
+    common::ObArenaAllocator document_allocator_;
+    storage::ObFTParseHelper helper_;
+    storage::ObFTWordMap words_;
+    bool configured_;
+    ObString parser_key_;
+    ObString options_key_;
+    int64_t null_mask_ = 0;
+    uint64_t generation_ = 0;
+    ObCollationType collation_ = CS_TYPE_INVALID;
+    int64_t word_bucket_count_ = 0;
+    common::ObArenaAllocator json_allocator_;
+    common::ObJsonArray token_array_;
+    common::ObJsonString *token_nodes_ = nullptr;
+    int64_t token_capacity_ = 0;
+    int64_t token_count_ = 0;
+  };
+  class TokenizePool;
+  static int eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &datum);
 
 private:
   static int parse_param(const ObExpr &expr,

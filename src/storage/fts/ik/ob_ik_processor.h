@@ -40,6 +40,14 @@ public:
 
   int init();
   int reset_resource();
+  void release_document()
+  {
+    reset_resource();
+    fulltext_ = nullptr;
+    fulltext_len_ = 0;
+    cursor_ = 0;
+    next_char_len_ = 0;
+  }
   int restart(const char *fulltext, int64_t fulltext_len, bool is_smart);
 
   int get_next_token(const char *&word, int64_t &word_len, int64_t &offset, int64_t &char_cnt);

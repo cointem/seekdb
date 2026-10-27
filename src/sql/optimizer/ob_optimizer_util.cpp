@@ -6936,6 +6936,25 @@ int ObOptimizerUtil::get_minset_of_exprs(const ObIArray<ObRawExpr *> &src_exprs,
   return ret;
 }
 
+static int check_fts_aux_ddl_sort(ObOptimizerContext &opt_ctx, bool &is_fts_aux_ddl)
+{
+  int ret = OB_SUCCESS;
+  is_fts_aux_ddl = false;
+  const ObTableSchema *ddl_schema = nullptr;
+  const TableItem *target = nullptr;
+  if (!opt_ctx.is_insert_stmt_in_online_ddl()) {
+  } else if (OB_ISNULL(opt_ctx.get_root_stmt()) || OB_ISNULL(opt_ctx.get_schema_guard())
+      || OB_ISNULL(target = opt_ctx.get_root_stmt()->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(opt_ctx.get_schema_guard()->get_table_schema(target->ddl_table_id_, ddl_schema))) {
+  } else if (OB_ISNULL(ddl_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    is_fts_aux_ddl = ddl_schema->is_fts_index_aux() || ddl_schema->is_fts_doc_word_aux();
+  }
+  return ret;
+}
+
 int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> &order_keys,
                                                 bool &can_sort_opt,
                                                 ObLogPlan& plan,
@@ -6954,14 +6973,28 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
     }
   } else {
     can_sort_opt &= config::_enable_newsort();
+    bool is_fts_aux_ddl = false;
+    OZ(check_fts_aux_ddl_sort(plan.get_optimizer_context(), is_fts_aux_ddl));
 
     for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); i++) {
-      if (!ObOrderPerservingEncoder::can_encode_sortkey(
-                            order_keys.at(i).expr_->get_data_type(),
-                            order_keys.at(i).expr_->get_collation_type())) {
-        can_sort_opt = false;
-      } else if (OB_FAIL(sort_keys.push_back(order_keys.at(i).expr_))) {
-      } else { /* do nothing */ }
+      const ObRawExpr *expr = order_keys.at(i).expr_;
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const ObObjType type = expr->get_data_type();
+        const ObCollationType cs = expr->get_collation_type();
+        // The encoder already implements VARCHAR, including PAD SPACE UTF8
+        // weights and escaped binary bytes. Only admit FTS terms and fixed-size
+        // docIDs here; leave the general ORDER BY type policy unchanged.
+        const bool fts_varchar = is_fts_aux_ddl && type == ObVarcharType
+            && (cs == CS_TYPE_UTF8MB4_BIN || cs == CS_TYPE_UTF8MB4_GENERAL_CI
+                || (cs == CS_TYPE_BINARY
+                    && expr->get_result_type().get_length() == static_cast<int64_t>(sizeof(common::ObDocId))));
+        if (!fts_varchar && !ObOrderPerservingEncoder::can_encode_sortkey(type, cs)) {
+          can_sort_opt = false;
+        } else if (OB_FAIL(sort_keys.push_back(order_keys.at(i).expr_))) {
+        }
+      }
     }
     old_can_opt = can_sort_opt;
 
@@ -6970,6 +7003,11 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
       // do nothing
     } else if (!can_sort_opt) {
       // do nothing
+    } else if (is_fts_aux_ddl) {
+      // A source document expands into many (word, docID) / (docID, word)
+      // postings. Its estimated cardinality/width describes the documents, not
+      // the emitted terms. Encode those actual term datums once per posting
+      // instead of repeatedly decoding their collation in the sort comparator.
     } else if (OB_FAIL(ObOptEstCost::estimate_width_for_exprs(plan.get_basic_table_metas(),
                                                               plan.get_selectivity_ctx(),
                                                               sort_keys,

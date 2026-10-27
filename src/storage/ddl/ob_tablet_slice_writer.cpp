@@ -641,7 +641,7 @@ void ObTabletSliceBufferTempFileWriter::reset()
 
 ObBatchSliceWriter::ObBatchSliceWriter()
   : arena_(ObMemAttr("ddl_batch_wrt")),
-    need_convert_storage_value_(false), direct_write_macro_block_(false), row_buffer_size_(256),
+    need_convert_storage_value_(false), direct_write_macro_block_(false), borrow_batch_input_(false), row_buffer_size_(256),
     need_check_rowkey_order_(true), rowkey_arena_(ObMemAttr("ddl_ck_rowkey"))
 {
 
@@ -664,7 +664,8 @@ int ObBatchSliceWriter::init(
     const bool direct_write_macro_block,
     const bool is_append_batch,
     const int64_t max_batch_size,
-    query::ObISpillBatchSpoolFactory &spool_factory)
+    query::ObISpillBatchSpoolFactory &spool_factory,
+    const bool borrow_batch_input)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -680,6 +681,7 @@ int ObBatchSliceWriter::init(
     sql_column_count_ = writer_param_.ddl_table_schema_.column_items_.count() - ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
     need_convert_storage_value_ = writer_param_.ddl_table_schema_.lob_column_idxs_.count() > 0 || writer_param_.ddl_table_schema_.reshape_column_idxs_.count() > 0;
     direct_write_macro_block_ = direct_write_macro_block;
+    borrow_batch_input_ = borrow_batch_input;
     need_check_rowkey_order_ = (need_check_rowkey_order_ && !(writer_param_.ddl_table_schema_.table_item_.vec_dim_ > 0)); // vector index not check order
     const int64_t request_column_count = writer_param_.ddl_table_schema_.column_items_.count();
     if (direct_write_macro_block_) {
@@ -769,7 +771,34 @@ int ObBatchSliceWriter::append_current_batch(const ObIArray<ObIVector *> &vector
       ready_vectors = &copied_vectors;
     }
   }
-  if (OB_SUCC(ret) && OB_NOT_NULL(ready_vectors)) {
+  if (OB_SUCC(ret) && OB_NOT_NULL(ready_vectors)
+      && borrow_batch_input_ && direct_write_macro_block_ && selector.get_offset() == 0 && row_buffer_.size() == 0) {
+    // The ordered datum-batch caller retains the input through this call.
+    // Write its vectors synchronously instead of copying every term into the
+    // row buffer. MVCC constants and validation match flush_row_buffer().
+    // The explicit tag permits supported encoders to copy the FTS columns in
+    // bulk. The macro writer retains order/MVCC validation and owns its last key;
+    // unsupported shapes and micro-block boundaries use the original row path.
+    ObBatchDatumRows borrowed_rows;
+    const int64_t mv_count = ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
+    for (int64_t i = 0; OB_SUCC(ret) && i < buffer_batch_rows_.vectors_.count(); ++i) {
+      ObIVector *vector = i < rowkey_column_count_ ? ready_vectors->at(i)
+          : i < rowkey_column_count_ + mv_count ? buffer_batch_rows_.vectors_.at(i)
+          : ready_vectors->at(i - mv_count);
+      if (OB_FAIL(borrowed_rows.vectors_.push_back(vector))) {
+      }
+    }
+    borrowed_rows.row_count_ = selector.size();
+    borrowed_rows.fts_bulk_load_ = true;
+    borrowed_rows.row_flag_ = ObDmlFlag::DF_INSERT;
+    const ObDDLTableSchema &schema = writer_param_.ddl_table_schema_;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObDDLStorageUtil::check_null_and_length(
+                   schema.table_item_.is_index_table_, schema.table_item_.has_lob_rowkey_,
+                   schema.table_item_.rowkey_column_num_, borrowed_rows))) {
+    } else if (OB_FAIL(storage_slice_writer_->append_batch(borrowed_rows))) {
+    }
+  } else if (OB_SUCC(ret) && OB_NOT_NULL(ready_vectors)) {
     int64_t remain_row_count = selector.size();
     int64_t current_offset = selector.get_offset();
     while (OB_SUCC(ret) && remain_row_count > 0) {

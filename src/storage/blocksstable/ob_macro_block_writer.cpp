@@ -502,7 +502,9 @@ ObMacroBlockWriter::ObMacroBlockWriter(const bool is_need_macro_buffer)
     io_buf_(nullptr),
     validator_(NULL),
     default_macro_flusher_(),
-    small_sstable_macro_flusher_()
+    small_sstable_macro_flusher_(),
+    fts_batch_rows_(0), fts_batch_fallbacks_(0), fts_batch_buf_fallbacks_(0),
+    fts_batch_summary_logged_(false)
 {
 }
 
@@ -537,6 +539,10 @@ void ObMacroBlockWriter::reset_for_open()
 
 void ObMacroBlockWriter::inner_reset()
 {
+  fts_batch_rows_ = 0;
+  fts_batch_fallbacks_ = 0;
+  fts_batch_buf_fallbacks_ = 0;
+  fts_batch_summary_logged_ = false;
   data_store_desc_ = nullptr;
   merge_block_info_.reset();
   if (OB_NOT_NULL(micro_writer_)) {
@@ -710,13 +716,119 @@ int ObMacroBlockWriter::append_batch(const ObBatchDatumRows &datum_rows,
 {
   int ret = OB_SUCCESS;
   ObBlockWriterConcurrentGuard guard(concurrent_lock_);
+  bool appended = false;
+  if (datum_rows.fts_bulk_load_ && datum_rows.row_count_ > 0) {
+    ret = try_append_fts_batch(datum_rows, appended);
+    if (OB_SUCC(ret) && !appended) {
+      ++fts_batch_fallbacks_;
+    }
+  }
   ObDatumRow &row = datum_row_;
-  for (int64_t i = 0; OB_SUCC(ret) && i < datum_rows.row_count_; i ++) {
+  for (int64_t i = 0; OB_SUCC(ret) && !appended && i < datum_rows.row_count_; i ++) {
     if (OB_FAIL(datum_rows.to_datum_row(i, row))) {
     } else if (OB_FAIL(append_row_inner(row, curr_macro_desc))) {
     }
   }
 
+  return ret;
+}
+
+int ObMacroBlockWriter::try_append_fts_batch(const ObBatchDatumRows &rows, bool &appended)
+{
+  int ret = OB_SUCCESS;
+  appended = false;
+  if (!rows.fts_bulk_load_ || rows.row_count_ <= 0 || rows.get_column_count() != 6
+      || nullptr == data_store_desc_ || nullptr == micro_writer_
+      || !data_store_desc_->get_is_ddl() || !data_store_desc_->is_major_or_meta_merge_type()
+      || data_store_desc_->get_schema_rowkey_col_cnt() != 2
+      || data_store_desc_->get_rowkey_column_count() != 4
+      || data_store_desc_->get_row_column_count() != 6
+      || !rows.row_flag_.is_insert() || !rows.mvcc_row_flag_.is_valid()
+      || rows.mvcc_row_flag_.is_uncommitted_row() || rows.mvcc_row_flag_.is_shadow_row()
+      || rows.mvcc_row_flag_.is_ghost_row()
+      || (nullptr != data_aggregator_ && !micro_writer_->micro_block_row_data_buffered())) {
+    return OB_SUCCESS;
+  }
+  for (int64_t col = 0; col < 6; ++col) {
+    if (nullptr == rows.vectors_.at(col)) {
+      return OB_SUCCESS;
+    }
+  }
+  // The original check_order also checks snapshot/effective transaction version,
+  // preceding last-key/MVCC order and Last flags. Call it for the first row only
+  // after proving every following row has the SAME committed version/zero seq
+  // and a STRICTLY increasing schema key. Otherwise replay the original row path
+  // from the start, preserving its error and partial-consumption behavior.
+  ObStorageDatum keys[2][2];
+  int64_t version = 0;
+  for (int64_t i = 0; i < rows.row_count_; ++i) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const char *payload = nullptr;
+      bool is_null = false;
+      ObLength length = 0;
+      rows.vectors_.at(col)->get_payload(i, is_null, payload, length);
+      if (is_null || (length > 0 && nullptr == payload) || (col >= 2 && length != sizeof(int64_t))) {
+        return OB_SUCCESS;
+      }
+      if (col < 2) {
+        keys[i % 2][col].shallow_copy_from_datum(ObDatum(payload, length, false));
+      } else {
+        int64_t value = 0;
+        MEMCPY(&value, payload, sizeof(value));
+        if (col == 2 && i == 0) {
+          version = value;
+        }
+        if ((col == 2 && (value >= 0 || value == INT64_MIN || value != version))
+            || (col == 3 && value != 0)) {
+          return OB_SUCCESS;
+        }
+      }
+    }
+    if (i > 0) {
+      ObDatumRowkey previous;
+      ObDatumRowkey current;
+      int32_t cmp = 0;
+      if (OB_FAIL(previous.assign(keys[(i - 1) % 2], 2))) {
+      } else if (OB_FAIL(current.assign(keys[i % 2], 2))) {
+      } else if (OB_FAIL(current.compare(previous, data_store_desc_->get_datum_utils(), cmp))) {
+      }
+      if (OB_FAIL(ret)) {
+        return ret;
+      } else if (cmp <= 0) {
+        return OB_SUCCESS;
+      }
+    }
+  }
+  ObDatumRow first_or_last;
+  if (OB_FAIL(first_or_last.init(6))) {
+  } else if (OB_FAIL(rows.to_datum_row(0, first_or_last))) {
+  } else if (OB_FAIL(check_order(first_or_last))) {
+  } else {
+    ret = micro_writer_->append_fts_batch(rows, 0, rows.row_count_);
+    if (OB_BUF_NOT_ENOUGH == ret) {
+      ++fts_batch_buf_fallbacks_;
+      ret = OB_SUCCESS;
+    } else if (OB_NOT_SUPPORTED == ret) {
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      // The micro writer has consumed ALL rows. Never retry this batch after
+      // an error in the normal commit-info/last-key/split/flush bookkeeping.
+      appended = true;
+      fts_batch_rows_ += rows.row_count_;
+      is_macro_or_micro_block_reused_ = false;
+      bool is_split = false;
+      if (OB_FAIL(update_micro_commit_info(first_or_last))) {
+      } else if (OB_FAIL(rows.to_datum_row(rows.row_count_ - 1, first_or_last))) {
+      } else if (OB_FAIL(save_last_key(first_or_last))) {
+      } else if (OB_FAIL(micro_block_adaptive_splitter_.check_need_split(
+          micro_writer_->get_block_size(), micro_writer_->get_row_count(),
+          data_store_desc_->get_micro_block_size(), macro_blocks_[current_index_].get_data_size(),
+          is_keep_freespace(), is_split))) {
+      } else if (is_split && OB_FAIL(build_micro_block())) {
+      } else if (OB_FAIL(try_active_flush_macro_block())) {
+      }
+    }
+  }
   return ret;
 }
 
@@ -1077,6 +1189,11 @@ int ObMacroBlockWriter::close()
     if (OB_SUCC(ret) && (NULL != pre_warmer_) && OB_FAIL(pre_warmer_->close())) {
       STORAGE_LOG(WARN, "failed to close pre warmer", KR(ret), KPC_(pre_warmer));
     }
+  }
+  if (!fts_batch_summary_logged_ && (fts_batch_rows_ > 0 || fts_batch_fallbacks_ > 0)) {
+    STORAGE_LOG(INFO, "FTS bulk encoder summary", K(ret), K_(fts_batch_rows),
+        K_(fts_batch_fallbacks), K_(fts_batch_buf_fallbacks));
+    fts_batch_summary_logged_ = true;
   }
   return ret;
 }

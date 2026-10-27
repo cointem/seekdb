@@ -146,6 +146,13 @@ public:
     STORAGE_LOG(ERROR, "Unspport append_batch", K(ret));
     return ret;
   }
+  // FTS-only all-or-nothing append: NOT_SUPPORTED/BUF_NOT_ENOUGH consume no
+  // rows and leave checksums/statistics untouched, allowing row-path fallback.
+  virtual int append_fts_batch(const ObBatchDatumRows &batch,
+                               const int64_t start, const int64_t row_count)
+  {
+    return OB_NOT_SUPPORTED;
+  }
   virtual int build_block(char *&buf, int64_t &size) = 0;
   virtual int64_t get_row_count() const = 0;
   virtual int64_t get_block_size() const = 0; // estimate block size after encoding

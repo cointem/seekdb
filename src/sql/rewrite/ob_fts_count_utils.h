@@ -23,6 +23,37 @@ namespace oceanbase
 {
 namespace sql
 {
+// A cardinality consumer must not observe rows, scores, ordering, side effects,
+// or a second filter. More general aggregates remain on the row protocol.
+inline bool is_fts_full_count(const ObDMLStmt *stmt)
+{
+  bool eligible = false;
+  if (nullptr != stmt && stmt->is_explain_stmt()) {
+    stmt = static_cast<const ObExplainStmt *>(stmt)->get_explain_query_stmt();
+  }
+  if (nullptr != stmt && stmt->is_select_stmt()) {
+    const ObSelectStmt *s = static_cast<const ObSelectStmt *>(stmt);
+    if (s->is_single_table_stmt() && s->get_table_item(0)->is_basic_table()
+        && s->is_scala_group_by() && s->get_aggr_item_size() == 1 && s->get_select_item_size() == 1
+        && s->get_select_item(0).expr_ == s->get_aggr_item(0)
+        && s->get_aggr_item(0)->get_expr_type() == T_FUN_COUNT
+        && s->get_aggr_item(0)->get_param_count() == 0 && !s->get_aggr_item(0)->is_param_distinct()
+        && !s->is_set_stmt() && !s->has_distinct() && !s->has_having() && !s->has_window_function()
+        && !s->has_order_by() && !s->has_limit() && !s->has_for_update() && !s->has_select_into()
+        && !s->is_calc_found_rows() && !s->has_recursive_cte() && !s->is_contains_assignment()
+        && s->get_subquery_expr_size() == 0 && s->get_condition_size() == 1
+        && s->get_match_exprs().count() == 1) {
+      const ObMatchFunRawExpr *match = s->get_match_exprs().at(0);
+      const ObRawExpr *filter = s->get_condition_exprs().at(0);
+      eligible = nullptr != match && nullptr != filter && match->get_mode_flag() == NATURAL_LANGUAGE_MODE
+          && nullptr != match->get_search_key() && match->get_search_key()->is_const_expr()
+          && (filter == match || (filter->get_expr_type() == T_OP_BOOL
+              && filter->get_param_count() == 1 && filter->get_param_expr(0) == match));
+    }
+  }
+  return eligible;
+}
+
 // The outer query observes only min(limit, max(visible_hits - offset, 0)).
 // Keep LIMIT/OFFSET and all storage visibility checks in their normal operators;
 // only implicit relevance ordering and scoring become unnecessary. Locking,

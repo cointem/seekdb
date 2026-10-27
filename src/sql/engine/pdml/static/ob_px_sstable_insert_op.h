@@ -94,6 +94,8 @@ protected:
   bool is_heap_plan() const { return MY_SPEC.regenerate_heap_table_pk_ || is_vec_gen_vid_; }
   int write_heap_slice_by_row();
   int write_ordered_slice_by_row();
+  int check_fts_batch_write(bool &enabled);
+  int write_ordered_slice_by_batch();
   int complete_direct_insert_worker();
   bool need_autoinc_by_row();
   int get_data_tablet_id(const ObTabletID &tablet_id, ObTabletID &data_tablet_id);
@@ -115,7 +117,8 @@ protected:
       const ObTabletID &tablet_id,
       const int64_t slice_idx,
       data_plane::ObIDirectInsertWriter *&slice_writer,
-      data_plane::ObDirectInsertAutoincParam *autoinc_param = nullptr);
+      data_plane::ObDirectInsertAutoincParam *autoinc_param = nullptr,
+      bool datum_batch = false);
   
 protected:
   static const uint64_t MAP_HASH_BUCKET_NUM = 1543L;

@@ -1894,6 +1894,9 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
+    // Datum-free cardinality batches are local-only. Do not allow lookup,
+    // PX, remote DAS serialization or partition routing to observe them.
+    ir_scan_ctdef->count_only_ = op.is_fts_count_only_scan();
     if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
     } else {
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
@@ -3029,7 +3032,8 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
         text_ir_scan_ctdef.inv_scan_doc_length_col_ =
             text_ir_scan_ctdef.get_inv_idx_scan_ctdef()->pd_expr_spec_.access_exprs_.at(doc_length_col_idx);
       }
-      if (OB_FAIL(result_output.push_back(text_ir_scan_ctdef.inv_scan_domain_id_col_))) {
+      if (!text_ir_scan_ctdef.is_count_only()
+          && OB_FAIL(result_output.push_back(text_ir_scan_ctdef.inv_scan_domain_id_col_))) {
       }
     }
   }
@@ -3065,7 +3069,8 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
                                             text_ir_scan_ctdef.relevance_proj_col_))) {
     } else if (OB_ISNULL(text_ir_scan_ctdef.relevance_proj_col_)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(result_output.push_back(text_ir_scan_ctdef.relevance_proj_col_))) {
+    } else if (!text_ir_scan_ctdef.is_count_only()
+        && OB_FAIL(result_output.push_back(text_ir_scan_ctdef.relevance_proj_col_))) {
     }
   }
 

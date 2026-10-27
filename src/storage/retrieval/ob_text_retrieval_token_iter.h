@@ -119,6 +119,12 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
 
+// Packed COUNT-only IDs remain owned by their token across shared eval-frame refills.
+struct CountDocId16
+{
+  char bytes_[16];
+};
+
 class ObTextRetrievalDaaTTokenIter final : public ObISRDaaTDimIter
 {
 public:
@@ -149,6 +155,35 @@ public:
     }
     return ret;
   }
+  // Count-stream cursor protocol: peek a stable, token-owned batch; consume
+  // only moves its cursor. Refill happens at the next peek, never mid-run.
+  // This protocol is exclusive with get_next_row()/next_doc_id() per rescan.
+  int peek_doc_id_run(const ObDocIdExt *&ids, int64_t &count, const int64_t capacity)
+  {
+    int ret = OB_SUCCESS;
+    prefer_count_doc_ids_ = false;
+    ids = nullptr;
+    count = 0;
+    if (cur_idx_ < 0 || cur_idx_ >= count_) {
+      int64_t loaded = 0;
+      ret = get_next_batch(MIN(capacity, max_batch_size_), loaded);
+    }
+    if (OB_SUCC(ret) && packed_count_batch_ && OB_FAIL(materialize_count_docids())) {
+    }
+    if (OB_SUCC(ret)) {
+      ids = &doc_id_[cur_idx_];
+      count = count_ - cur_idx_;
+    }
+    return ret;
+  }
+  // A non-packed batch is left untouched for the generic cursor protocol.
+  int peek_count_doc_id_run(const CountDocId16 *&ids, int64_t &count,
+                           const int64_t capacity, bool &packed);
+  void consume_doc_id_run(const int64_t count)
+  {
+    OB_ASSERT(count >= 0 && cur_idx_ >= 0 && cur_idx_ + count <= count_);
+    cur_idx_ += count;
+  }
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
     int ret = OB_SUCCESS;
@@ -161,6 +196,8 @@ public:
 private:
   int save_relevances_and_docids();
   int save_docids();
+  int save_count_docids();
+  int materialize_count_docids();
   ObArenaAllocator *allocator_;
   ObTextRetrievalTokenIter *token_iter_;
   sql::ObEvalCtx *eval_ctx_;
@@ -171,6 +208,9 @@ private:
   int64_t count_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
+  CountDocId16 *count_doc_ids_;
+  bool prefer_count_doc_ids_;
+  bool packed_count_batch_;
   common::ObDatumCmpFuncType cmp_func_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);

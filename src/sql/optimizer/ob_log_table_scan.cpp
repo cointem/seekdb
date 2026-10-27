@@ -2597,6 +2597,16 @@ int ObLogTableScan::get_index_merge_calc_exprs(ObIArray<ObRawExpr *> &all_exprs)
   return ret;
 }
 
+bool ObLogTableScan::is_fts_count_only_scan() const
+{
+  return is_text_retrieval_scan() && text_retrieval_info_.count_only_
+      && !get_index_back() && !use_index_merge() && !use_das() && !is_sample_scan()
+      && get_filter_exprs().empty() && get_pushdown_filter_exprs().empty()
+      && !is_distributed() && !is_gi_above() && get_parallel() == 1
+      && !text_retrieval_info_.need_sort() && nullptr != get_table_partition_info()
+      && !get_table_partition_info()->get_table_location().is_partitioned();
+}
+
 int ObLogTableScan::print_text_retrieval_annotation(char *buf, int64_t buf_len, int64_t &pos, ExplainType type)
 {
   int ret = OB_SUCCESS;
@@ -2610,6 +2620,7 @@ int ObLogTableScan::print_text_retrieval_annotation(char *buf, int64_t buf_len, 
   if (OB_FAIL(BUF_PRINTF(", "))) {
   } else if (OB_FAIL(BUF_PRINTF("\n      "))) {
   } else if (OB_FAIL(BUF_PRINTF("calc_relevance=%s", calc_relevance ? "true" : "false"))) {
+  } else if (is_fts_count_only_scan() && OB_FAIL(BUF_PRINTF(", count_only=true"))) {
   } else if (OB_FAIL(BUF_PRINTF(", "))) {
   } else if (FALSE_IT(EXPLAIN_PRINT_EXPR(match_expr, type))) {
   }

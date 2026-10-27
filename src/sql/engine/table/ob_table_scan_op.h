@@ -477,6 +477,7 @@ public:
   int switch_iterator() override;
   int inner_get_next_row() override;
   int inner_get_next_batch(const int64_t max_row_cnt) override;
+  int get_fts_count(int64_t &count);
   int inner_close() override;
   int do_init_before_get_row() override;
   void destroy() override;

@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_micro_block_encoder.h"
+#include "lib/container/ob_se_array.h"
 #include "storage/blocksstable/index_block/ob_index_block_aggregator.h"
 
 namespace oceanbase
@@ -397,6 +398,150 @@ int ObMicroBlockEncoder::append_row(const ObDatumRow &row)
       }
       cal_row_stat(row);
       estimate_size_ += store_size;
+    }
+  }
+  return ret;
+}
+
+int ObMicroBlockEncoder::append_fts_batch(
+    const ObBatchDatumRows &batch, const int64_t start, const int64_t row_count)
+{
+  int ret = OB_SUCCESS;
+  const int64_t columns = 6;
+  const int64_t datum_bytes = columns * sizeof(ObDatum);
+  // Capability checks precede inner_init/reserve/checksum/statistic changes.
+  if (!batch.fts_bulk_load_ || batch.get_column_count() != columns
+      || ctx_.column_cnt_ != columns || need_check_lob_
+      || !batch.row_flag_.is_insert() || !batch.mvcc_row_flag_.is_valid()
+      || batch.mvcc_row_flag_.is_uncommitted_row() || batch.mvcc_row_flag_.is_shadow_row()
+      || batch.mvcc_row_flag_.is_ghost_row()) {
+    return OB_NOT_SUPPORTED;
+  } else if (IS_NOT_INIT) {
+    return OB_NOT_INIT;
+  } else if (start < 0 || row_count <= 0 || start > batch.row_count_
+      || row_count > batch.row_count_ - start) {
+    return OB_INVALID_ARGUMENT;
+  } else if (encoder_freezed_) {
+    return OB_ERR_UNEXPECTED;
+  } else if (row_buf_holder_.length() != length_) {
+    return OB_NOT_SUPPORTED;
+  } else if (row_count > MAX_MICRO_BLOCK_ROW_CNT) {
+    return OB_BUF_NOT_ENOUGH;
+  }
+  for (int64_t col = 0; col < columns; ++col) {
+    const ObObjTypeStoreClass sc = get_store_class_map()[ctx_.col_descs_->at(col).col_type_.get_type_class()];
+    if (nullptr == batch.vectors_.at(col)
+        || (col < 2 ? ObStringSC != sc : (ObIntSC != sc && ObUIntSC != sc))) {
+      return OB_NOT_SUPPORTED;
+    }
+    const VectorFormat format = batch.vectors_.at(col)->get_format();
+    if (format != VEC_FIXED && format != VEC_CONTINUOUS && format != VEC_DISCRETE
+        && format != VEC_UNIFORM && format != VEC_UNIFORM_CONST) {
+      return OB_NOT_SUPPORTED;
+    }
+  }
+  ObSEArray<int64_t, 256> row_store_sizes;
+  int64_t total_copy_size = 0;
+  int64_t version = 0;
+  for (int64_t row = start; OB_SUCC(ret) && row < start + row_count; ++row) {
+    int64_t store_size = 0;
+    for (int64_t col = 0; col < columns; ++col) {
+      const char *payload = nullptr;
+      bool is_null = false;
+      ObLength length = 0;
+      batch.vectors_.at(col)->get_payload(row, is_null, payload, length);
+      if (is_null || (length > 0 && nullptr == payload) || (col >= 2 && length != sizeof(int64_t))) {
+        return OB_NOT_SUPPORTED;
+      }
+      if (col == 2 || col == 3) {
+        int64_t value = 0;
+        MEMCPY(&value, payload, sizeof(value));
+        if (col == 2 && row == start) {
+          version = value;
+        }
+        if ((col == 2 && (value >= 0 || value == INT64_MIN || value != version))
+            || (col == 3 && value != 0)) {
+          return OB_NOT_SUPPORTED;
+        }
+      }
+      // Same normalization and variable-length safety allowance as copy_cell.
+      store_size += col < 2 ? length + sizeof(uint64_t) : sizeof(uint64_t);
+    }
+    if (OB_FAIL(row_store_sizes.push_back(store_size))) {
+    } else {
+      total_copy_size += datum_bytes + store_size;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(inner_init())) {
+  } else {
+    int64_t simulated_length = length_;
+    int64_t simulated_estimate = estimate_size_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_count; ++i) {
+      const int64_t rows = datum_rows_.count() + i;
+      const int64_t store_size = row_store_sizes.at(i);
+      // append_row historically permits encoding_granularity_ + 1 rows.
+      // A large first row must use process_large_row on the original row path.
+      if (rows >= MAX_MICRO_BLOCK_ROW_CNT || rows > ctx_.encoding_granularity_
+          || ((rows == 0 || rows >= ctx_.minimum_rows_)
+              && (simulated_length + datum_bytes >= estimate_size_limit_
+                  || simulated_estimate + store_size >= estimate_size_limit_))
+          || simulated_estimate + store_size + header_size_ > block_size_upper_bound_) {
+        ret = OB_BUF_NOT_ENOUGH;
+      } else {
+        simulated_length += datum_bytes + store_size;
+        simulated_estimate += store_size;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    // No rows, bytes, checksums or row statistics have been committed.
+  } else if (datum_rows_.empty() && OB_FAIL(init_column_ctxs())) {
+  } else if (OB_FAIL(datum_rows_.reserve(datum_rows_.count() + row_count))) {
+  } else if (OB_FAIL(row_buf_holder_.ensure_space(total_copy_size))) {
+  } else if (OB_FAIL(set_datum_rows_ptr())) {
+  } else {
+    ObMicroBlockHeader *header = get_header(data_buffer_);
+    const int64_t first_offset = length_;
+    for (int64_t row = start; OB_SUCC(ret) && row < start + row_count; ++row) {
+      const int64_t row_offset = length_;
+      ObDatum *datums = reinterpret_cast<ObDatum *>(row_buf_holder_.data() + row_offset);
+      MEMSET(datums, 0, datum_bytes);
+      length_ += datum_bytes;
+      for (int64_t col = 0; col < columns; ++col) {
+        const char *payload = nullptr;
+        bool is_null = false;
+        ObLength length = 0;
+        batch.vectors_.at(col)->get_payload(row, is_null, payload, length);
+        datums[col] = ObDatum(payload, length, false);
+        datums[col].ptr_ = row_buf_holder_.data() + length_;
+        if (length > 0) {
+          MEMCPY(const_cast<char *>(datums[col].ptr_), payload, length);
+        }
+        length_ += col < 2 ? length + sizeof(uint64_t) : sizeof(uint64_t);
+      }
+      // All capacity was reserved above: push_back cannot grow this array.
+      ObConstDatumRow copied_row(datums, columns, row_offset);
+      if (OB_FAIL(datum_rows_.push_back(copied_row))) {
+      } else if (need_cal_row_checksum()
+          && OB_FAIL(checksum_helper_.cal_row_checksum<ObDatum>(datums, columns))) {
+      } else {
+        estimate_size_ += row_store_sizes.at(row - start);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(row_buf_holder_.write_nop(length_ - first_offset))) {
+    } else if (header->has_column_checksum_
+        && OB_FAIL(checksum_helper_.cal_column_checksum(
+            batch.vectors_, start, row_count, header->column_checksums_))) {
+    } else {
+      if (batch.mvcc_row_flag_.is_first_multi_version_row()) {
+        row_count_delta_ += row_count * batch.row_flag_.get_delta();
+      }
+      if (batch.mvcc_row_flag_.is_last_multi_version_row()) {
+        last_rows_count_ += row_count;
+      }
+      is_last_row_last_flag_ = batch.mvcc_row_flag_.is_last_multi_version_row();
     }
   }
   return ret;

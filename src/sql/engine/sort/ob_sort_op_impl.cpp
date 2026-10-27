@@ -573,7 +573,9 @@ ObSortOpImpl::ObSortOpImpl() :
   max_node_cnt_(0), part_cnt_(0), topn_cnt_(INT64_MAX), outputted_rows_cnt_(0),
   is_fetch_with_ties_(false), topn_heap_(NULL), ties_array_pos_(0), last_ties_row_(NULL),
   pt_buckets_(NULL), use_partition_topn_sort_(false), heap_nodes_(), cur_heap_idx_(0), rows_(NULL),
-  sort_exprs_(nullptr), compress_type_(NONE_COMPRESSOR)
+  sort_exprs_(nullptr), compress_type_(NONE_COMPRESSOR),
+  fts_stable_output_batch_(false), fts_output_arena_(ObMemAttr("FTSortOutput")), fts_prescan_run_rows_(0),
+  fts_prescan_store_("FTSortPrescan")
 {}
 
 ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
@@ -594,7 +596,9 @@ ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
     is_fetch_with_ties_(false), topn_heap_(NULL), ties_array_pos_(0),
     last_ties_row_(NULL), pt_buckets_(NULL), use_partition_topn_sort_(false), heap_nodes_(), cur_heap_idx_(0), part_group_cnt_(0),
     rows_(NULL), sort_exprs_(nullptr),
-    compress_type_(NONE_COMPRESSOR), use_compact_format_(false)
+    compress_type_(NONE_COMPRESSOR), use_compact_format_(false),
+    fts_stable_output_batch_(false), fts_output_arena_(ObMemAttr("FTSortOutput")), fts_prescan_run_rows_(0),
+  fts_prescan_store_("FTSortPrescan")
 {
 }
 
@@ -804,6 +808,8 @@ int ObSortOpImpl::init(
 
 void ObSortOpImpl::reuse()
 {
+  reset_fts_prescan();
+  fts_output_arena_.reset();
   sorted_ = false;
   iter_.reset();
   default_blk_holder_.release();
@@ -851,6 +857,7 @@ void ObSortOpImpl::unregister_profile_if_necessary()
 
 void ObSortOpImpl::reset()
 {
+  fts_stable_output_batch_ = false;
   sql_mem_processor_.unregister_profile();
   iter_.reset();
   reuse();
@@ -1297,6 +1304,100 @@ int ObSortOpImpl::add_batch(const common::ObIArray<ObExpr *> &exprs,
   return ret;
 }
 
+int ObSortOpImpl::init_fts_prescan()
+{
+  int ret = OB_SUCCESS;
+  if (!inited_ || !fts_stable_output_batch_ || use_heap_sort_ || use_partition_topn_sort_
+      || nullptr == mem_context_) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    reset_fts_prescan();
+    fts_prescan_store_.set_allocator(mem_context_->get_malloc_allocator());
+    if (OB_FAIL(fts_prescan_store_.init(16 * 1024, ObCtxIds::WORK_AREA,
+                   "FTSortPrescan", true /* enable dump */))) {
+    } else {
+      fts_prescan_store_.set_dir_id(sql_mem_processor_.get_dir_id());
+      fts_prescan_store_.set_callback(&sql_mem_processor_);
+      fts_prescan_store_.set_io_event_observer(io_event_observer_);
+    }
+  }
+  return ret;
+}
+
+int ObSortOpImpl::add_fts_prescan_batch(const common::ObIArray<ObExpr *> &exprs,
+                                      const ObBitVector &skip, const int64_t batch_size)
+{
+  int ret = OB_SUCCESS;
+  int64_t stored_count = 0;
+  // Prescan only drains upstream. It must not sort or dump a sorted run while
+  // another PX producer can still be blocked waiting for this consumer.
+  if (OB_FAIL(fts_prescan_store_.add_batch(exprs, *eval_ctx_, skip, batch_size,
+                                         stored_count))) {
+  }
+  return ret;
+}
+
+void ObSortOpImpl::adopt_fts_prescan_blocks()
+{
+  // free_block() wrote the owning iterator into each block trailer. Moving
+  // lists does not change that owner; release must precede iterator reset.
+  while (fts_prescan_pending_blocks_.block_list_.get_size() > 0) {
+    fts_prescan_owned_blocks_.block_list_.add_last(
+        fts_prescan_pending_blocks_.block_list_.remove_first());
+  }
+}
+
+void ObSortOpImpl::reset_fts_prescan()
+{
+  fts_prescan_owned_blocks_.release();
+  fts_prescan_pending_blocks_.release();
+  fts_prescan_iter_.reset();
+  fts_prescan_iter_.set_blk_holder_ptr(nullptr);
+  fts_prescan_store_.reset();
+  fts_prescan_run_rows_ = 0;
+}
+
+int ObSortOpImpl::finish_fts_prescan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(fts_prescan_store_.finish_add_row(false))) {
+  } else if (OB_FAIL(fts_prescan_store_.begin(fts_prescan_iter_))) {
+  } else {
+    fts_prescan_iter_.set_blk_holder_ptr(&fts_prescan_pending_blocks_);
+    // Do not share stored_rows_: before_add_row() may dump the preceding run,
+    // whose sorting code is allowed to reuse that scratch array.
+    const ObChunkDatumStore::StoredRow *batch[256];
+    int64_t read_rows = 0;
+    while (OB_SUCC(ret)) {
+      read_rows = 0;
+      if (OB_FAIL(exec_ctx_->check_status())) {
+      } else if (OB_FAIL(fts_prescan_iter_.get_next_batch(batch, 256, read_rows))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          adopt_fts_prescan_blocks();
+          break;
+        }
+      } else if (read_rows > 0 && OB_FAIL(before_add_row())) {
+      } else {
+        // Pending blocks include any crossed by the just-fetched batch. A
+        // before_add_row dump can release old owned blocks, but cannot free
+        // this batch before these pointers have joined the new sort run.
+        for (int64_t i = 0; OB_SUCC(ret) && i < read_rows; ++i) {
+          if (OB_FAIL(after_add_row(const_cast<ObChunkDatumStore::StoredRow *>(batch[i])))) {
+          } else {
+            ++fts_prescan_run_rows_;
+          }
+        }
+        adopt_fts_prescan_blocks();
+      }
+    }
+  }
+  LOG_INFO("fts native prescan handoff finished", K(ret),
+           "rows", fts_prescan_store_.get_row_cnt(),
+           "spill_bytes", fts_prescan_store_.get_file_size(), K(fts_prescan_run_rows_));
+  return ret;
+}
+
 int ObSortOpImpl::add_stored_row(const ObChunkDatumStore::StoredRow &input_row)
 {
   int ret = OB_SUCCESS;
@@ -1610,6 +1711,10 @@ int ObSortOpImpl::do_dump()
       row_idx_ = 0;
       quick_sort_array_.reset();
       datum_store_.reset();
+      // build_chunk has consumed this run. Keep newly-read pending blocks and
+      // the iterator's current block alive for the next run.
+      fts_prescan_owned_blocks_.release();
+      fts_prescan_run_rows_ = 0;
       inmem_row_size_ = 0;
       mem_check_interval_mask_ = 1;
       sql_mem_processor_.set_number_pass(level + 1);
@@ -1884,7 +1989,7 @@ int ObSortOpImpl::sort_inmem_data()
       } else if (NULL != rows_->at(rows_->count() - 1)
           && OB_FAIL(rows_->push_back(NULL))) {
       } else {
-        int64_t merge_ways = rows_->count() - datum_store_.get_row_cnt();
+        int64_t merge_ways = rows_->count() - datum_store_.get_row_cnt() - fts_prescan_run_rows_;
         LOG_TRACE("do local merge sort ways",
             K(merge_ways), K(rows_->count()), K(datum_store_.get_row_cnt()));
         if (merge_ways > INMEMORY_MERGE_SORT_WARN_WAYS) {
@@ -2191,12 +2296,21 @@ int ObSortOpImpl::get_next_batch_stored_rows(int64_t max_cnt, int64_t &read_rows
     ret = OB_NOT_INIT;
   } else {
     read_rows = 0;
+    static constexpr int64_t FTS_OUTPUT_BYTES = 1L << 20;
+    int64_t output_bytes = 0;
+    if (fts_stable_output_batch_) {
+      // Previous output has been consumed before this call. The byte limit is
+      // soft: stop before the next row once reached, at most one row over it.
+      fts_output_arena_.reuse();
+      max_cnt = MIN(max_cnt, 256L);
+    }
     if (use_compact_store()) {
       compact_blk_holder_.release();
     } else {
       default_blk_holder_.release();
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < max_cnt; i++) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < max_cnt
+         && (!fts_stable_output_batch_ || output_bytes < FTS_OUTPUT_BYTES); i++) {
       const ObChunkDatumStore::StoredRow *sr = NULL;
       if (OB_FAIL((this->*next_stored_row_func_)(sr))) {
         // next_stored_row_func_ is safe to return OB_ITER_END twice.
@@ -2210,8 +2324,23 @@ int ObSortOpImpl::get_next_batch_stored_rows(int64_t max_cnt, int64_t &read_rows
       } else if (OB_ISNULL(sr)) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        stored_rows_[read_rows++] = const_cast<ObChunkDatumStore::StoredRow *>(sr);
-        if (use_compact_store()) {
+        ObChunkDatumStore::StoredRow *stable_row = const_cast<ObChunkDatumStore::StoredRow *>(sr);
+        if (fts_stable_output_batch_ && use_compact_store()
+            && next_stored_row_func_ != &ObSortOpImpl::array_next_stored_row) {
+          // A compact reader reuses its single decoded row on the next fetch.
+          // assign() copies the complete payload and relocates datum pointers.
+          // Array rows instead remain owned by datum_store_ and need no copy.
+          if (OB_ISNULL(stable_row = static_cast<ObChunkDatumStore::StoredRow *>(
+                  fts_output_arena_.alloc(sr->row_size_)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (OB_FAIL(stable_row->assign(sr))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          stored_rows_[read_rows++] = stable_row;
+          output_bytes += sr->row_size_;
+        }
+        if (use_compact_store() && !fts_stable_output_batch_) {
           // can't hold multi rows for get_batch, if we use compact/encoding
           break;
         }

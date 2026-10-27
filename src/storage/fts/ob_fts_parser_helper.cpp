@@ -176,6 +176,7 @@ ObFTParseData::~ObFTParseData()
 
 int ObFTParseData::init()
 {
+  generation_.fetch_add(1, std::memory_order_acq_rel);
   int ret = OB_SUCCESS;
   lib::ObMemAttr mem_attr;
   mem_attr.label_ = FTPARSE_DATA_MEMORY_LABEL;
@@ -225,6 +226,7 @@ int ObFTParseData::init_dict_hub()
 
 void ObFTParseData::destroy()
 {
+  generation_.fetch_add(1, std::memory_order_acq_rel);
   if (OB_NOT_NULL(stop_word_checker_)) {
     stop_word_checker_->destroy();
     OB_DELETEx(ObStopWordChecker, &handler_allocator_, stop_word_checker_);
@@ -275,11 +277,14 @@ public:
     }
     return ret;
   }
+  int64_t retained_bytes() const { return objects_.total() + scratch_.total(); }
   void finish()
   {
     if (is_ik_) {
       ik_.clear_document();
       scratch_.reuse();
+    } else {
+      beng_.clear_document();
     }
   }
 private:
@@ -415,6 +420,11 @@ int ObFTParseHelper::init(common::ObIAllocator *allocator,
     reset();
   }
   return ret;
+}
+
+int64_t ObFTParseHelper::retained_workspace_bytes() const
+{
+  return nullptr == workspace_ ? 0 : workspace_->retained_bytes();
 }
 
 void ObFTParseHelper::reset()

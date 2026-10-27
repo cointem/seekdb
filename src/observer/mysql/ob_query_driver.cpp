@@ -375,6 +375,18 @@ int ObQueryDriver::like_match(const char* str, int64_t length_str, int64_t i,
 int ObQueryDriver::process_lob_locator_results(ObObj& value, sql::ObResultSet &result)
 {
   int ret = OB_SUCCESS;
+  // These types are already the normalized payload representation. A locator
+  // reader would return the same bytes/type; avoid constructing its temporary
+  // allocation context for every inline JSON result.
+  if (!value.has_lob_header()
+      && (value.is_json() || value.is_geometry() || ObLongTextType == value.get_type())) {
+    const ObString payload = value.get_string();
+    if (nullptr != payload.ptr() && payload.length() > 0) {
+      // Match set_lob_value's in-row/collation metadata normalization too.
+      value.set_lob_value(value.get_type(), payload.ptr(), payload.length());
+    }
+    return ret;
+  }
   ObArenaAllocator *allocator = NULL;
   if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
   } else if (OB_ISNULL(allocator)) {
@@ -402,6 +414,13 @@ int ObQueryDriver::process_lob_locator_results(ObObj& value,
     // do nothing
   } else if (OB_ISNULL(exec_ctx)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (!value.has_lob_header()
+             && (value.is_json() || value.is_geometry() || ObLongTextType == value.get_type())) {
+    // Tiny/medium text still requires the original type normalization below.
+    const ObString payload = value.get_string();
+    if (nullptr != payload.ptr() && payload.length() > 0) {
+      value.set_lob_value(value.get_type(), payload.ptr(), payload.length());
+    }
   } else {
     // Should remove locator header and read full lob data
     ObString data;

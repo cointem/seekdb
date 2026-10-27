@@ -15,6 +15,13 @@
  */
 
 #include "config_bridge.h"
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <atomic>
+#include <cstdlib>
+#include "lib/allocator/ob_malloc.h"
+#include "lib/hash_func/murmur_hash.h"
 #include "lib/container/ob_se_array.h"
 #include "common/json_type/ob_json_bin.h"
 #include "share/ob_errno.h"
@@ -37,6 +44,439 @@ namespace sql
 using storage::ObFTWordMap;
 
 
+// Bounded, task-owned pure computation sharing. No storage rows, doc IDs used
+// for output, routing state, or snapshot visibility are shared between readers.
+class FTBuildSharedDomain
+{
+public:
+  static constexpr int64_t MAX_DOMAINS = 8;
+  static constexpr int64_t BUCKETS = 1024;
+  static constexpr int64_t MAX_ENTRIES = 4096;
+  static constexpr int64_t MAX_BYTES = 8 * 1024 * 1024;
+  static constexpr int64_t MAX_DOCUMENT_BYTES = 1024 * 1024;
+  static bool self_test();
+  struct Term { int64_t length_; int64_t count_; const char *data_; };
+  struct Entry {
+    Entry *next_ = nullptr;
+    uint64_t hash_ = 0;
+    uint64_t generation_ = 0;
+    ObObjMeta meta_;
+    int64_t refs_ = 2; // map + caller; protected by the domain mutex
+    int64_t bytes_ = 0;
+    int64_t text_length_ = 0;
+    int64_t id_length_ = 0;
+    int state_ = 0; // 0 parsing, 1 ready, 2 aborted
+    int readers_ = 0;
+    char *text_ = nullptr;
+    char *id_ = nullptr;
+    void *material_ = nullptr;
+    int64_t material_bytes_ = 0;
+    int64_t term_count_ = 0;
+    int64_t doc_length_ = 0;
+  };
+
+  static FTBuildSharedDomain *attach(const FTBuildShareIdentity &id, int role)
+  {
+    if (id.parent_task_id_ <= 0 || id.parent_execution_id_ < -1
+        || id.child_task_id_ <= 0 || id.child_execution_id_ < 0
+        || id.snapshot_version_ <= 0 || id.base_table_id_ == 0
+        || id.base_tablet_id_ == 0 || id.base_schema_version_ <= 0
+        || id.parser_name_.empty() || id.parser_name_.length() + id.parser_properties_.length() > 8192
+        || !builtin_properties(id)) { return nullptr; }
+    Registry *rp = registry();
+    if (rp == nullptr) { return nullptr; }
+    Registry &r = *rp;
+    std::lock_guard<std::mutex> lock(r.mutex_);
+    int empty = -1;
+    for (int i = 0; i < MAX_DOMAINS; ++i) {
+      FTBuildSharedDomain *d = r.domains_[i];
+      if (d == nullptr) { if (empty < 0) { empty = i; } }
+      else if (d->matches(id)) {
+        if (d->leases_ >= 64 || !d->join(id, role)) { return nullptr; }
+        ++d->leases_;
+        return d;
+      }
+    }
+    if (empty < 0) { return nullptr; }
+    const int64_t bytes = sizeof(FTBuildSharedDomain) + id.parser_name_.length()
+        + id.parser_properties_.length();
+    void *buf = ob_malloc(bytes, ObMemAttr("FTBuildShare"));
+    if (buf == nullptr) { return nullptr; }
+    auto *d = new (buf) FTBuildSharedDomain(id);
+    d->join(id, role);
+    r.domains_[empty] = d;
+    return d;
+  }
+
+  static void detach(FTBuildSharedDomain *d, int role)
+  {
+    if (d != nullptr) {
+      bool destroy = false;
+      {
+        Registry &r = *registry();
+        std::lock_guard<std::mutex> lock(r.mutex_);
+        --d->active_[role];
+        if (--d->leases_ == 0) {
+          for (int i = 0; i < MAX_DOMAINS; ++i) {
+            if (r.domains_[i] == d) { r.domains_[i] = nullptr; break; }
+          }
+          destroy = true;
+        }
+      }
+      // Last lease cleanup never holds the registry lock while freeing material.
+      if (destroy) { d->~FTBuildSharedDomain(); ob_free(d); }
+    }
+  }
+
+  Entry *acquire(const ObDatum &id, const ObString &text, const ObObjMeta &meta,
+                 uint64_t generation, bool &producer, bool &waited)
+  {
+    producer = false;
+    waited = false;
+    if (id.is_null() || text.length() > MAX_DOCUMENT_BYTES || id.len_ > 1024) { return nullptr; }
+    uint64_t hash = murmurhash(id.ptr_, id.len_, generation);
+    hash = murmurhash(text.ptr(), text.length(), hash);
+    hash = murmurhash(&meta, sizeof(meta), hash);
+    std::unique_lock<std::mutex> lock(mutex_);
+    const int bucket = hash % BUCKETS;
+    for (Entry *e = buckets_[bucket]; e != nullptr; e = e->next_) {
+      if (e->hash_ == hash && e->generation_ == generation
+          && MEMCMP(&e->meta_, &meta, sizeof(meta)) == 0 && e->id_length_ == id.len_ && e->text_length_ == text.length()
+          && MEMCMP(e->id_, id.ptr_, id.len_) == 0
+          && MEMCMP(e->text_, text.ptr(), text.length()) == 0) {
+        ++e->refs_;
+        if (e->state_ == 0) {
+          waited = true;
+          // Only wait for this document's parser, never for another scan or
+          // writer to progress. Timeout safely falls back to independent parse.
+          ready_.wait_for(lock, std::chrono::milliseconds(20), [&] { return e->state_ != 0; });
+        }
+        if (e->state_ == 1) { return e; }
+        unref_locked(e);
+        return nullptr;
+      }
+    }
+    // A missing/cancelled sibling cannot benefit from newly retained material.
+    // Existing READY entries may still be consumed after its lease has ended.
+    if (active_[0].load() == 0 || active_[1].load() == 0) { return nullptr; }
+    const int64_t bytes = sizeof(Entry) + id.len_ + text.length();
+    if (entries_ >= MAX_ENTRIES || bytes > budget_ - bytes_) { return nullptr; }
+    void *buf = ob_malloc(bytes, ObMemAttr("FTBuildShare"));
+    if (buf == nullptr) { return nullptr; }
+    Entry *e = new (buf) Entry;
+    e->hash_ = hash;
+    e->generation_ = generation;
+    e->meta_ = meta;
+    e->bytes_ = bytes;
+    e->id_length_ = id.len_;
+    e->text_length_ = text.length();
+    e->id_ = reinterpret_cast<char *>(e + 1);
+    e->text_ = e->id_ + id.len_;
+    MEMCPY(e->id_, id.ptr_, id.len_);
+    MEMCPY(e->text_, text.ptr(), text.length());
+    e->next_ = buckets_[bucket];
+    buckets_[bucket] = e;
+    bytes_ += bytes;
+    ++entries_;
+    producer = true;
+    return e;
+  }
+
+  bool publish(Entry *e, const ObFTWordMap &words, int64_t doc_length, int role, int64_t &bytes)
+  {
+    if (fail_publish_) { abort(e); return false; }
+    int64_t size = words.size() * static_cast<int64_t>(sizeof(Term));
+    if (size > MAX_DOCUMENT_BYTES) { abort(e); return false; }
+    for (auto it = words.begin(); it != words.end(); ++it) {
+      const int64_t len = it->first.get_word().get_string().length();
+      if (len > MAX_DOCUMENT_BYTES - size) { abort(e); return false; }
+      size += len;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (size > budget_ - bytes_) { abort_locked(e); ready_.notify_all(); return false; }
+      bytes_ += size; // Account before allocation and until the final caller drops its reference.
+      e->material_bytes_ = size;
+    }
+    void *material = size == 0 ? nullptr : ob_malloc(size, ObMemAttr("FTBuildShare"));
+    if (size > 0 && material == nullptr) { abort(e); return false; }
+    Term *terms = static_cast<Term *>(material);
+    char *out = material == nullptr ? nullptr
+        : reinterpret_cast<char *>(material) + words.size() * sizeof(Term);
+    int64_t idx = 0;
+    for (auto it = words.begin(); it != words.end(); ++it, ++idx) {
+      const ObString word = it->first.get_word().get_string();
+      terms[idx] = {word.length(), it->second, out};
+      MEMCPY(out, word.ptr(), word.length());
+      out += word.length();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      e->material_ = material;
+      e->term_count_ = words.size();
+      e->doc_length_ = doc_length;
+      e->readers_ |= 1 << role;
+      e->state_ = 1;
+      bytes = size;
+    }
+    ready_.notify_all();
+    return true;
+  }
+
+  void consumed(Entry *e, int role)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    e->readers_ |= 1 << role;
+    if (e->readers_ == 3) { erase_locked(e); }
+  }
+  void abort(Entry *e)
+  {
+    { std::lock_guard<std::mutex> lock(mutex_); abort_locked(e); }
+    ready_.notify_all();
+  }
+  void release(Entry *e)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    unref_locked(e);
+  }
+
+private:
+  struct Registry { std::mutex mutex_; FTBuildSharedDomain *domains_[MAX_DOMAINS] = {}; };
+  static Registry *registry()
+  {
+    static Registry *r = [] {
+      void *p = ob_malloc(sizeof(Registry), ObMemAttr("FTShareControl"));
+      return p == nullptr ? nullptr : new (p) Registry;
+    }();
+    return r;
+  }
+  static bool builtin_properties(const FTBuildShareIdentity &id)
+  {
+    storage::ObFTParser parser;
+    storage::ObFTParserJsonProps props;
+    if (OB_SUCCESS != parser.parse_from_str(id.parser_name_.ptr(), id.parser_name_.length())
+        || !parser.is_ik() || parser.get_parser_version() != storage::ObFTParser::BUILTIN_VERSION
+        || OB_SUCCESS != props.init()
+        || OB_SUCCESS != props.parse_from_valid_str(id.parser_properties_)) { return false; }
+    // Only recognized builtin dictionaries/compiled stop lists are pure. Never
+    // infer immutability merely from a generation counter for a table dictionary.
+    ObString value;
+    int ret = props.config_get_dict_table(value);
+    if (ret != OB_SEARCH_NOT_FOUND && (ret != OB_SUCCESS
+        || value != ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE))) { return false; }
+    value.reset();
+    ret = props.config_get_quantifier_table(value);
+    if (ret != OB_SEARCH_NOT_FOUND && (ret != OB_SUCCESS
+        || value != ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE))) { return false; }
+    value.reset();
+    ret = props.config_get_stopword_table(value);
+    if (ret != OB_SEARCH_NOT_FOUND && (ret != OB_SUCCESS
+        || value != ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE))) { return false; }
+    return true;
+  }
+  explicit FTBuildSharedDomain(const FTBuildShareIdentity &id) : identity_(id)
+  {
+    // Diagnostic controls are read only at domain creation, never per posting.
+    const char *budget = std::getenv("FTS_BUILD_SHARE_MAX_BYTES");
+    if (budget != nullptr) {
+      char *end = nullptr;
+      const long long value = std::strtoll(budget, &end, 10);
+      if (end != budget && *end == '\0' && value >= 0 && value <= MAX_BYTES) { budget_ = value; }
+    }
+    const char *fail = std::getenv("FTS_BUILD_SHARE_TEST_FAIL_PUBLISH");
+    fail_publish_ = fail != nullptr && std::strcmp(fail, "1") == 0;
+    char *p = reinterpret_cast<char *>(this + 1);
+    MEMCPY(p, id.parser_name_.ptr(), id.parser_name_.length());
+    identity_.parser_name_.assign_ptr(p, id.parser_name_.length());
+    p += id.parser_name_.length();
+    MEMCPY(p, id.parser_properties_.ptr(), id.parser_properties_.length());
+    identity_.parser_properties_.assign_ptr(p, id.parser_properties_.length());
+  }
+  ~FTBuildSharedDomain()
+  {
+    for (int i = 0; i < BUCKETS; ++i) {
+      for (Entry *e = buckets_[i]; e != nullptr;) {
+        Entry *next = e->next_;
+        if (e->material_ != nullptr) { ob_free(e->material_); }
+        e->~Entry(); ob_free(e); e = next;
+      }
+    }
+  }
+  bool matches(const FTBuildShareIdentity &id) const
+  {
+    return identity_.tenant_id_ == id.tenant_id_ && identity_.parent_task_id_ == id.parent_task_id_
+        && identity_.parent_execution_id_ == id.parent_execution_id_
+        && identity_.parent_index_id_ == id.parent_index_id_ && identity_.base_table_id_ == id.base_table_id_
+        && identity_.base_tablet_id_ == id.base_tablet_id_
+        // Each aux scan may compile after a different schema publication.
+        // Exact input bytes/meta/config/generation define the pure parse; keep
+        // source layout versions in each reader's binding, not the shared key.
+        && identity_.parser_name_ == id.parser_name_ && identity_.parser_properties_ == id.parser_properties_;
+  }
+  bool join(const FTBuildShareIdentity &id, int role)
+  {
+    if (tasks_[role] != 0 && (tasks_[role] != id.child_task_id_
+        || executions_[role] != id.child_execution_id_ || tables_[role] != id.aux_table_id_
+        || snapshots_[role] != id.snapshot_version_
+        || source_schemas_[role] != id.base_schema_version_)) { return false; }
+    tasks_[role] = id.child_task_id_; executions_[role] = id.child_execution_id_;
+    tables_[role] = id.aux_table_id_; snapshots_[role] = id.snapshot_version_;
+    source_schemas_[role] = id.base_schema_version_;
+    ++active_[role];
+    return true;
+  }
+  void abort_locked(Entry *e) { e->state_ = 2; erase_locked(e); }
+  void erase_locked(Entry *e)
+  {
+    Entry **p = &buckets_[e->hash_ % BUCKETS];
+    while (*p != nullptr && *p != e) { p = &(*p)->next_; }
+    if (*p == e) { *p = e->next_; --entries_; unref_locked(e); }
+  }
+  void unref_locked(Entry *e)
+  {
+    if (--e->refs_ == 0) {
+      bytes_ -= e->bytes_ + e->material_bytes_;
+      if (e->material_ != nullptr) { ob_free(e->material_); }
+      e->~Entry(); ob_free(e);
+    }
+  }
+  FTBuildShareIdentity identity_;
+  int64_t leases_ = 1; // protected by registry mutex
+  int64_t tasks_[2] = {}, executions_[2] = {}, snapshots_[2] = {}, source_schemas_[2] = {};
+  uint64_t tables_[2] = {};
+  std::atomic<int64_t> active_[2]{};
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  Entry *buckets_[BUCKETS] = {};
+  int64_t bytes_ = 0, entries_ = 0;
+  int64_t budget_ = MAX_BYTES;
+  bool fail_publish_ = false;
+};
+
+// Explicit opt-in diagnostics exercise the real coordinator, without SQL,
+// fake production keys, schema changes, or a separate test-only cache model.
+bool FTBuildSharedDomain::self_test()
+{
+  FTBuildShareIdentity id;
+  id.tenant_id_ = 1; // isolated synthetic identity; no SQL or tenant lookup
+  id.parent_task_id_ = id.base_schema_version_ = 1;
+  id.parent_execution_id_ = -1; // Real FTS coordinator sentinel; child SQL epochs remain positive.
+  id.base_table_id_ = id.base_tablet_id_ = id.parent_index_id_ = 1;
+  id.child_task_id_ = id.child_execution_id_ = id.aux_table_id_ = 1;
+  id.snapshot_version_ = 10;
+  id.parser_name_ = ObString::make_string("ik.1");
+  id.parser_properties_ = ObString::make_string("{\"ik_mode\":\"smart\"}");
+  const int64_t bytes = sizeof(FTBuildSharedDomain) + id.parser_name_.length() + id.parser_properties_.length();
+  void *buf = ob_malloc(bytes, ObMemAttr("FTShareSelfTest"));
+  if (buf == nullptr) { return false; }
+  auto *d = new (buf) FTBuildSharedDomain(id);
+  d->budget_ = MAX_BYTES;
+  d->fail_publish_ = false;
+  bool ok = builtin_properties(id) && d->join(id, 0);
+  FTBuildShareIdentity sibling = id;
+  sibling.child_task_id_ = sibling.aux_table_id_ = 2;
+  sibling.snapshot_version_ = 20;
+  sibling.base_schema_version_ = 2;
+  ok = d->join(sibling, 1) && ok; // Different SCNs/layout versions, same pure input.
+  FTBuildShareIdentity changed_layout = id;
+  changed_layout.base_schema_version_ = 3;
+  ok = d->matches(changed_layout) && !d->join(changed_layout, 0) && ok;
+  ObObjMeta meta;
+  meta.set_varchar(); meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+  ObDatum doc;
+  doc.set_string("doc", 3);
+  ObFTWordMap words;
+  int ret = words.create(16, ObMemAttr("FTShareSelfTest"));
+  if (ret == OB_SUCCESS) { ret = words.set_refactored(storage::ObFTWord(5, "alpha", meta), 2); }
+  bool producer = false, waited = false;
+  Entry *first = ret == OB_SUCCESS ? d->acquire(doc, ObString("alpha alpha"), meta, 1, producer, waited) : nullptr;
+  int64_t published = 0;
+  ok = ok && first != nullptr && producer;
+  if (first != nullptr) {
+    ok = d->publish(first, words, 2, 0, published) && ok;
+    Entry *hit = d->acquire(doc, ObString("alpha alpha"), meta, 1, producer, waited);
+    ok = ok && hit == first && !producer;
+    if (hit != nullptr) { d->release(hit); }
+    // Same doc with different bytes, collation, or dictionary generation is a
+    // producer/miss; no snapshot-derived guess can turn it into a cache hit.
+    ObObjMeta changed_meta = meta; changed_meta.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+    for (int i = 0; i < 3; ++i) {
+      Entry *miss = d->acquire(doc, i == 0 ? ObString("beta") : ObString("alpha alpha"),
+          i == 1 ? changed_meta : meta, i == 2 ? 2 : 1, producer, waited);
+      ok = ok && miss != nullptr && producer;
+      if (miss != nullptr) { d->abort(miss); d->release(miss); }
+    }
+    FTBuildShareIdentity other = id; ++other.parent_task_id_;
+    ok = ok && !d->matches(other);
+    other = id; other.parser_properties_ = ObString::make_string("{\"ik_mode\":\"max_word\"}");
+    ok = ok && !d->matches(other);
+    other.parser_properties_ = ObString::make_string("{\"dict_table\":\"user.dynamic_dict\"}");
+    ok = ok && !builtin_properties(other);
+    d->consumed(first, 1);
+    d->release(first);
+  }
+  ok = ok && d->bytes_ == 0 && d->entries_ == 0;
+  d->budget_ = 0;
+  Entry *limited = d->acquire(doc, ObString("alpha"), meta, 1, producer, waited);
+  ok = ok && limited == nullptr;
+  if (limited != nullptr) { d->abort(limited); d->release(limited); }
+  d->budget_ = MAX_BYTES;
+  Entry *pending = d->acquire(doc, ObString("alpha"), meta, 1, producer, waited);
+  if (pending != nullptr) {
+    Entry *timeout = d->acquire(doc, ObString("alpha"), meta, 1, producer, waited);
+    ok = ok && timeout == nullptr && waited;
+    if (timeout != nullptr) { d->release(timeout); }
+    d->fail_publish_ = true;
+    ok = !d->publish(pending, words, 2, 0, published) && ok;
+    d->release(pending);
+    d->fail_publish_ = false;
+    Entry *retry = d->acquire(doc, ObString("alpha"), meta, 1, producer, waited);
+    ok = ok && retry != nullptr && producer;
+    if (retry != nullptr) { d->abort(retry); d->release(retry); }
+  } else { ok = false; }
+  ok = ok && d->bytes_ == 0 && d->entries_ == 0;
+  d->~FTBuildSharedDomain(); ob_free(d);
+  LOG_INFO("fts build shared parse self test", K(ok));
+  return ok;
+}
+
+void ObFTIndexRowCache::enable_shared_parse(const FTBuildShareIdentity &identity)
+{
+  disable_shared_parse();
+  share_attempted_ = true;
+  const int64_t parser_len = MIN(identity.parser_name_.length(), static_cast<int32_t>(sizeof(share_parser_) - 1));
+  MEMCPY(share_parser_, identity.parser_name_.ptr(), parser_len);
+  share_parser_[parser_len] = '\0';
+  share_parent_task_ = identity.parent_task_id_;
+  share_child_task_ = identity.child_task_id_;
+  share_snapshot_ = identity.snapshot_version_;
+  share_base_schema_ = identity.base_schema_version_;
+  static const bool checks_ok = [] {
+    const char *check = std::getenv("FTS_BUILD_SHARE_SELFTEST");
+    return check == nullptr || std::strcmp(check, "1") != 0 || FTBuildSharedDomain::self_test();
+  }();
+  shared_domain_ = checks_ok ? FTBuildSharedDomain::attach(identity, is_fts_index_aux_ ? 0 : 1) : nullptr;
+}
+
+void ObFTIndexRowCache::disable_shared_parse()
+{
+  if (shared_entry_ != nullptr) {
+    shared_domain_->release(static_cast<FTBuildSharedDomain::Entry *>(shared_entry_));
+    shared_entry_ = nullptr;
+    shared_row_count_ = 0;
+  }
+  if (share_attempted_) {
+    LOG_INFO("fts build pure parse sharing", "enabled", shared_domain_ != nullptr,
+             K_(is_fts_index_aux), K_(share_hits), K_(share_misses), K_(share_fallbacks),
+             K_(share_waits), K_(share_bytes), "parser", share_parser_,
+             K_(share_parent_task), K_(share_child_task), K_(share_snapshot), K_(share_base_schema));
+  }
+  FTBuildSharedDomain::detach(shared_domain_, is_fts_index_aux_ ? 0 : 1);
+  shared_domain_ = nullptr;
+  share_attempted_ = false;
+  share_hits_ = share_misses_ = share_fallbacks_ = share_waits_ = share_bytes_ = 0;
+}
+
 ObObjDatumMapType ObFTIndexRowCache::FTS_INDEX_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
 ObObjDatumMapType ObFTIndexRowCache::FTS_DOC_WORD_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
 
@@ -44,7 +484,7 @@ ObExprOperatorType ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE[] = {T_FUN_SYS_WORD_SE
 ObExprOperatorType ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE[] = {T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
 
 ObFTIndexRowCache::ObFTIndexRowCache()
-  : words_(), word_iter_(), current_row_(), doc_id_(), doc_length_(0), word_buckets_(0),
+  : merge_memctx_(), batch_memctx_(), words_(), word_iter_(), current_row_(), doc_id_(), doc_length_(0), word_buckets_(0),
     row_idx_(0),
     is_fts_index_aux_(true),
     helper_(),
@@ -105,19 +545,84 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(doc_id_.deep_copy(doc_id_datum, merge_memctx_->get_arena_allocator()))) {
-    } else if (OB_FAIL(helper_.segment(ft_obj_meta, fulltext.ptr(), fulltext.length(),
-                                      doc_length_, words_))) {
     } else {
-      // BENG copies output tokens; the other parsers allocate their casedown
-      // output in the helper allocator. Only the source document ID needs an
-      // independent copy across expression-frame reuse during batch emission.
-      word_iter_ = words_.begin();
-      if (words_.size() == 0) {
-        ret = OB_ITER_END;
+      struct ParseTicket {
+        FTBuildSharedDomain *domain_;
+        FTBuildSharedDomain::Entry *entry_ = nullptr;
+        bool producer_ = false;
+        bool published_ = false;
+        ~ParseTicket() {
+          if (entry_ != nullptr) {
+            if (producer_ && !published_) { domain_->abort(entry_); }
+            domain_->release(entry_);
+          }
+        }
+      } ticket{shared_domain_};
+      bool waited = false;
+      const uint64_t generation = storage::ObFTParseData::instance().generation();
+      if (shared_domain_ != nullptr) {
+        ticket.entry_ = shared_domain_->acquire(doc_id_datum, fulltext, ft_obj_meta,
+                                               generation, ticket.producer_, waited);
+      }
+      share_waits_ += waited;
+      if (ticket.entry_ != nullptr && !ticket.producer_) {
+        // Drain the immutable contiguous material directly. No second parse,
+        // word-map rebuild, or per-term copy on a sharing hit.
+        ++share_hits_;
+        shared_entry_ = ticket.entry_;
+        shared_row_count_ = ticket.entry_->term_count_;
+        doc_length_ = ticket.entry_->doc_length_;
+        shared_domain_->consumed(ticket.entry_, is_fts_index_aux_ ? 0 : 1);
+        ticket.entry_ = nullptr;
+      } else {
+        if (ticket.producer_) { ++share_misses_; } else { ++share_fallbacks_; }
+        if (OB_FAIL(helper_.segment(ft_obj_meta, fulltext.ptr(), fulltext.length(), doc_length_, words_))) {
+        } else if (ticket.entry_ != nullptr && generation == storage::ObFTParseData::instance().generation()) {
+          int64_t published_bytes = 0;
+          if (shared_domain_->publish(ticket.entry_, words_, doc_length_,
+                                      is_fts_index_aux_ ? 0 : 1, published_bytes)) {
+            ticket.published_ = true;
+            shared_entry_ = ticket.entry_;
+            shared_row_count_ = ticket.entry_->term_count_;
+            share_bytes_ += published_bytes;
+            ticket.entry_ = nullptr;
+          } else {
+            // publish has already aborted/unlinked the reservation.
+            ticket.published_ = true;
+            ++share_fallbacks_;
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        word_iter_ = words_.begin();
+        if (current_word_count() == 0) { ret = OB_ITER_END; }
       }
     }
   }
   return ret;
+}
+
+ObDatum ObFTIndexRowCache::current_word() const
+{
+  if (shared_entry_ == nullptr) { return word_iter_->first.get_word(); }
+  auto *e = static_cast<FTBuildSharedDomain::Entry *>(shared_entry_);
+  const auto &term = static_cast<FTBuildSharedDomain::Term *>(e->material_)[row_idx_];
+  ObDatum datum;
+  datum.set_string(term.data_, term.length_);
+  return datum;
+}
+
+int64_t ObFTIndexRowCache::current_frequency() const
+{
+  if (shared_entry_ == nullptr) { return word_iter_->second; }
+  auto *e = static_cast<FTBuildSharedDomain::Entry *>(shared_entry_);
+  return static_cast<FTBuildSharedDomain::Term *>(e->material_)[row_idx_].count_;
+}
+
+void ObFTIndexRowCache::advance_word()
+{
+  if (shared_entry_ == nullptr) { ++word_iter_; }
+  ++row_idx_;
 }
 
 int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
@@ -125,46 +630,119 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (row_idx_ >= words_.size()) {
+  } else if (row_idx_ >= current_word_count()) {
     ret = OB_ITER_END;
   } else {
     const int64_t word_idx = is_fts_index_aux_ ? 0 : 1;
     const int64_t doc_idx = is_fts_index_aux_ ? 1 : 0;
     // The scan consumes this row before requesting the next one. Token bytes
     // and the document ID remain valid until the next document is segmented.
-    current_row_.storage_datums_[word_idx].set_datum(word_iter_->first.get_word());
+    current_row_.storage_datums_[word_idx].set_datum(current_word());
     current_row_.storage_datums_[doc_idx].shallow_copy_from_datum(doc_id_);
-    current_row_.storage_datums_[2].set_uint(word_iter_->second);
+    current_row_.storage_datums_[2].set_uint(current_frequency());
     current_row_.storage_datums_[3].set_uint(doc_length_);
     row = &current_row_;
-    ++word_iter_;
-    ++row_idx_;
+    advance_word();
   }
   return ret;
 }
 
-int ObFTIndexRowCache::get_next_batch(ObDatum *columns[4], int64_t capacity, int64_t &count)
+int ObFTIndexRowCache::begin_batch(int64_t capacity, FTBuildBatchRow *&rows)
 {
   int ret = OB_SUCCESS;
-  count = 0;
+  rows = nullptr;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (OB_UNLIKELY(capacity <= 0) || OB_ISNULL(columns[0])
-             || OB_ISNULL(columns[1]) || OB_ISNULL(columns[2]) || OB_ISNULL(columns[3])) {
+  } else if (OB_UNLIKELY(capacity <= 0 || capacity > INT64_MAX / static_cast<int64_t>(sizeof(FTBuildBatchRow)))) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    const int64_t word_idx = is_fts_index_aux_ ? 0 : 1;
-    const int64_t doc_idx = is_fts_index_aux_ ? 1 : 0;
-    // All datums refer to this document's retained parser workspace. Stopping
-    // at the document boundary lets the downstream batch consumer borrow them.
-    while (count < capacity && row_idx_ < words_.size()) {
-      columns[word_idx][count] = word_iter_->first.get_word();
-      columns[doc_idx][count] = doc_id_;
-      columns[2][count].set_uint(word_iter_->second);
-      columns[3][count].set_uint(doc_length_);
-      ++count;
-      ++word_iter_;
-      ++row_idx_;
+    if (OB_ISNULL(batch_memctx_)) {
+      lib::ContextParam param;
+      param.set_mem_attr("FTBuildBatch", ObCtxIds::DEFAULT_CTX_ID)
+           .set_properties(lib::USE_TL_PAGE_OPTIONAL);
+      ret = CURRENT_CONTEXT->CREATE_CONTEXT(batch_memctx_, param);
+    }
+    if (OB_SUCC(ret)) {
+      batch_memctx_->reset_remain_one_page();
+      void *buffer = batch_memctx_->get_arena_allocator().alloc(capacity * sizeof(FTBuildBatchRow));
+      if (OB_ISNULL(buffer)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        rows = static_cast<FTBuildBatchRow *>(buffer);
+        for (int64_t i = 0; i < capacity; ++i) {
+          new (&rows[i]) FTBuildBatchRow();
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFTIndexRowCache::append_batch(FTBuildBatchRow *rows, int64_t capacity,
+                                  int64_t &count, int64_t &token_bytes, bool &full)
+{
+  int ret = OB_SUCCESS;
+  static constexpr int64_t MAX_BATCH_TOKEN_BYTES = 1L << 20;
+  full = false;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(rows) || OB_UNLIKELY(count < 0 || count >= capacity || token_bytes < 0
+                                   || token_bytes > MAX_BATCH_TOKEN_BYTES)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t desired = MIN(capacity - count, static_cast<int64_t>(current_word_count() - row_idx_));
+    const int64_t doc_id_bytes = doc_id_.is_null() ? 0 : doc_id_.len_;
+    int64_t bytes = doc_id_bytes;
+    int64_t take = 0;
+    auto iter = word_iter_;
+    while (take < desired) {
+      const int64_t word_bytes = shared_entry_ == nullptr ? iter->first.get_word().len_
+          : static_cast<FTBuildSharedDomain::Term *>(
+              static_cast<FTBuildSharedDomain::Entry *>(shared_entry_)->material_)[row_idx_ + take].length_;
+      if (bytes > MAX_BATCH_TOKEN_BYTES - token_bytes
+          || word_bytes > MAX_BATCH_TOKEN_BYTES - token_bytes - bytes) {
+        break;
+      }
+      bytes += word_bytes;
+      if (shared_entry_ == nullptr) { ++iter; }
+      ++take;
+    }
+    if (0 == take) {
+      if (0 == count && desired > 0) {
+        // A single legal token can exceed the copy budget. Emit just that row
+        // borrowing the current document and do not advance the source scan.
+        rows[count].word_ = current_word();
+        rows[count].doc_id_ = doc_id_;
+        rows[count].word_count_ = current_frequency();
+        rows[count].doc_length_ = doc_length_;
+        advance_word();
+        ++count;
+      }
+      full = true;
+    } else {
+      char *buffer = static_cast<char *>(batch_memctx_->get_arena_allocator().alloc(bytes));
+      ObDatum batch_doc_id;
+      int64_t pos = 0;
+      if (OB_ISNULL(buffer)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(batch_doc_id.deep_copy(doc_id_, buffer, bytes, pos))) {
+      } else {
+        token_bytes += bytes;
+        // One allocation per document chunk, rather than one per posting.
+        // Shared docID bytes and term bytes all live until begin_batch().
+        for (int64_t i = 0; OB_SUCC(ret) && i < take; ++i) {
+          FTBuildBatchRow &row = rows[count];
+          if (OB_FAIL(row.word_.deep_copy(current_word(), buffer, bytes, pos))) {
+          } else {
+            row.doc_id_ = batch_doc_id;
+            row.word_count_ = current_frequency();
+            row.doc_length_ = doc_length_;
+            ++count;
+            advance_word();
+          }
+        }
+      }
+      full = count == capacity || take < desired;
     }
   }
   return ret;
@@ -172,6 +750,7 @@ int ObFTIndexRowCache::get_next_batch(ObDatum *columns[4], int64_t capacity, int
 
 void ObFTIndexRowCache::reset()
 {
+  disable_shared_parse();
   words_.destroy();
   word_buckets_ = 0;
   current_row_.reset();
@@ -182,11 +761,20 @@ void ObFTIndexRowCache::reset()
     DESTROY_CONTEXT(merge_memctx_);
     merge_memctx_ = nullptr;
   }
+  if (OB_NOT_NULL(batch_memctx_)) {
+    DESTROY_CONTEXT(batch_memctx_);
+    batch_memctx_ = nullptr;
+  }
   is_inited_ = false;
 }
 
 void ObFTIndexRowCache::reuse()
 {
+  if (shared_entry_ != nullptr) {
+    shared_domain_->release(static_cast<FTBuildSharedDomain::Entry *>(shared_entry_));
+    shared_entry_ = nullptr;
+    shared_row_count_ = 0;
+  }
   if (words_.created()) {
     words_.reuse();
   }
