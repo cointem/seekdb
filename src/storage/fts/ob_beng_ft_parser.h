@@ -24,8 +24,21 @@
 
 namespace oceanbase
 {
+namespace common { class ObObjMeta; }
 namespace storage
 {
+
+class FTUniqueTerms;
+struct ObFTParserProperty;
+
+// DEFAULT-expression-only fused collector. An unsupported document/charset
+// leaves terms untouched and handled=false, allowing the ordinary BENG replay.
+// Successful collection may set terms.overflow(); its caller must then replay.
+int try_beng_ascii_unique(const ObCharsetInfo *cs,
+                          const common::ObObjMeta &meta,
+                          const ObFTParserProperty &property,
+                          const char *text, int64_t length,
+                          FTUniqueTerms &terms, bool &handled);
 
 class ObBEngFTParser final : public ObITokenIterator
 {
@@ -58,6 +71,10 @@ public:
       int64_t &word_len,
       int64_t &char_len,
       int64_t &word_freq) override;
+
+  // View expires at the next token/clear_document unless it points into input.
+  int get_next_token_view(const char *&word, int64_t &word_len,
+                          int64_t &char_len, int64_t &word_freq);
 
   VIRTUAL_TO_STRING_KV(K_(analysis_ctx), K_(english_analyzer), KP_(token_stream), K_(is_inited));
 private:

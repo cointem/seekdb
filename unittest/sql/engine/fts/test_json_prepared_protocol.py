@@ -25,6 +25,13 @@ def main():
               'quote" slash\\ newline\n tab\t 数据库 😀',
               ["x" * 1024, {"nested": [1, False, None]}],
               {"large": "汉字" * 22000, "tail": "kept"}]
+    # Flat string arrays use a dedicated wire serializer. Check every control
+    # escape, UTF-8, local-buffer (64 bytes) edges and descriptor/big-payload tails.
+    values += [[chr(i) for i in range(32)] + ['"', '\\', '/', '\x7f', '数据库 é 😀 𠀀'],
+               ['', ''], ['a'] * 15, ['b'] * 16, ['c'] * 17,
+               ['汉字' * 22000], ['\x00' * 1024]]
+    values += [['x' * n] for n in (59, 60, 61, 127, 128, 255, 256, 65535, 65536)]
+    values += [['prefix'] * 17 + [{'nested': ['tail', None]}]]
     statements = ["SELECT CAST(" + literal(json.dumps(value, ensure_ascii=False))
                   + " AS JSON);" for value in values]
     for name in ("space", "beng", "ik"):
@@ -38,9 +45,13 @@ def main():
             input=script, text=True, capture_output=True, timeout=180)
         if process.returncode:
             raise AssertionError(process.stdout + process.stderr)
-        actual = [json.loads(line) for line in result.read_text().splitlines() if line]
+        raw = [line for line in result.read_text().splitlines() if line]
+        actual = [json.loads(line) for line in raw]
     assert len(actual) == len(values) + 3, len(actual)
     assert actual[:len(values)] == values, "prepared JSON wire payload changed"
+    for index, value in enumerate(values):
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            assert raw[index] == json.dumps(value, ensure_ascii=False), ("flat JSON wire bytes", index)
     for tokens in actual[len(values):]:
         assert sorted(tokens) == ["alpha", "beta"], tokens
     print(f"PASS: {len(actual)} prepared JSON values, including escaped/large payloads and TOKENIZE")

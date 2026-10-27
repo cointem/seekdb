@@ -19,6 +19,7 @@
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/ob_allocator.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/container/ob_vector.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -42,7 +43,7 @@ public:
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
-  ~ObFTRangeDict() override{};
+  ~ObFTRangeDict() override { destroy(); }
 
 public:
   struct ObFTRange final
@@ -93,11 +94,15 @@ private:
     for (int64_t i = 0; i < range_dicts_.size(); i++) {
       range_dicts_[i].dict_->~ObIFTDict(); // destroy dict
     }
+    bmp_root_ranges_.reset();
     range_dicts_.reset();
     range_alloc_.reset();
   }
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
+  int find_first_char_range_legacy(const ObString &single_word, ObIFTDict *&dict) const;
+  void rebuild_root_index(bool verify = true);
+  bool verify_root_index() const;
 
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
@@ -105,6 +110,10 @@ private:
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
+  // Immutable after publication; each rebuild first invalidates this index.
+  // Exact canonical UTF8 BMP keys map to the first matching range; -1 is a
+  // proven negative result only after ALL boundaries have been validated.
+  common::ObSEArray<int32_t, 0> bmp_root_ranges_;
   ObFTCacheRangeContainer *range_container_; // only used to read cache
 
 private:

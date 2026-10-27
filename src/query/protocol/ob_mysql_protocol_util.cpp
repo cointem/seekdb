@@ -17,6 +17,10 @@
 #include "query/protocol/ob_mysql_protocol_util.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 
 #include "common/ob_field.h"
@@ -24,6 +28,7 @@
 #include "common/timezone/ob_time_convert.h"
 #include "lib/allocator/ob_allocator.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/geometry/ob_geo_wkb_define.h"
 
 using namespace oceanbase::common;
@@ -94,6 +99,77 @@ static_assert(sizeof(type_maps_) / sizeof(ObMySQLTypeMap) == ObMaxType, "Not eno
 
 namespace {
 
+// Diagnostic-only A/B control. Neither clocks nor counters are touched unless
+// FTS_TOKENIZE_PROFILE=1; the generic ablation flag is ignored otherwise.
+bool json_wire_profile_enabled()
+{
+  static const bool enabled = []() {
+    const char *value = std::getenv("FTS_TOKENIZE_PROFILE");
+    return nullptr != value && 0 == std::strcmp(value, "1");
+  }();
+  return enabled;
+}
+
+bool json_wire_profile_generic()
+{
+  static const bool generic = []() {
+    const char *value = std::getenv("FTS_TOKENIZE_PROFILE_GENERIC_JSON");
+    return nullptr != value && 0 == std::strcmp(value, "1");
+  }();
+  return generic;
+}
+
+uint64_t json_wire_thread_cpu_ns()
+{
+  struct timespec stamp;
+  return 0 == clock_gettime(CLOCK_THREAD_CPUTIME_ID, &stamp)
+      ? static_cast<uint64_t>(stamp.tv_sec) * 1000000000ULL + stamp.tv_nsec : 0;
+}
+
+struct JsonWireProfileTotals
+{
+  std::atomic<uint64_t> cells_{0};
+  std::atomic<uint64_t> flat_{0};
+  std::atomic<uint64_t> generic_{0};
+  std::atomic<uint64_t> flat_cpu_ns_{0};
+  std::atomic<uint64_t> generic_cpu_ns_{0};
+};
+
+class JsonWireProfileScope
+{
+public:
+  JsonWireProfileScope()
+      : enabled_(json_wire_profile_enabled()), flat_(false),
+        started_(enabled_ ? json_wire_thread_cpu_ns() : 0) {}
+  ~JsonWireProfileScope()
+  {
+    if (enabled_) {
+      static JsonWireProfileTotals totals;
+      const uint64_t end = json_wire_thread_cpu_ns();
+      const uint64_t elapsed = started_ != 0 && end >= started_ ? end - started_ : 0;
+      (flat_ ? totals.flat_ : totals.generic_).fetch_add(1, std::memory_order_relaxed);
+      (flat_ ? totals.flat_cpu_ns_ : totals.generic_cpu_ns_).fetch_add(elapsed, std::memory_order_relaxed);
+      const uint64_t cells = totals.cells_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (0 == cells % 3000) {
+        std::fprintf(stderr,
+            "FTS_TOKENIZE_JSON_PROFILE {\"cells\":%llu,\"flat\":%llu,\"generic\":%llu,"
+            "\"flat_cpu_ns\":%llu,\"generic_cpu_ns\":%llu}\n",
+            static_cast<unsigned long long>(cells),
+            static_cast<unsigned long long>(totals.flat_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(totals.generic_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(totals.flat_cpu_ns_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(totals.generic_cpu_ns_.load(std::memory_order_relaxed)));
+      }
+    }
+  }
+  bool force_generic() const { return enabled_ && json_wire_profile_generic(); }
+  void mark_flat() { flat_ = true; }
+private:
+  bool enabled_;
+  bool flat_;
+  uint64_t started_;
+};
+
 int set_borrowed_lenenc_bytes(const ObString &value, ObMySQLCellValue &out) {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(value.length() < 0 ||
@@ -127,6 +203,144 @@ int set_copied_bytes(ObIAllocator &allocator, const ObMySQLCellValueKind kind,
     } else {
       MEMCPY(buf, data, len);
       out.set_borrowed_bytes(kind, buf, len);
+    }
+  }
+  return ret;
+}
+
+struct JsonWireString
+{
+  const char *data_;
+  int64_t length_;
+  int64_t escaped_length_;
+};
+
+// Match ObJsonBaseUtil::add_double_quote exactly: UTF-8 bytes are opaque,
+// controls/quotes/backslashes escape, and '/' remains unchanged.
+bool json_wire_needs_escape(const char c)
+{
+  const unsigned char byte = static_cast<unsigned char>(c);
+  return byte <= 0x1f || byte == '"' || byte == '\\';
+}
+
+bool json_wire_short_escape(const char c)
+{
+  return c == '"' || c == '\\' || c == '\b' || c == '\t'
+      || c == '\n' || c == '\f' || c == '\r';
+}
+
+int try_flat_json_string_array(ObJsonBin &root, ObIAllocator &allocator,
+                               ObMySQLCellValue &out, bool &handled)
+{
+  int ret = OB_SUCCESS;
+  handled = false;
+  if (root.json_type() != ObJsonNodeType::J_ARRAY) {
+    return ret;
+  }
+  ObSEArray<JsonWireString, 16> strings;
+  int64_t text_length = 2; // '[' and ']'
+  const uint64_t count = root.element_count();
+  for (uint64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+    ObJsonBin child(&allocator);
+    ObIJsonBase *value = &child;
+    if (OB_FAIL(root.get_array_element(i, value))) {
+    } else if (child.json_type() != ObJsonNodeType::J_STRING) {
+      // No output has been published, and root is unchanged. Preserve generic
+      // nested/scalar/extended SQL JSON handling, including its error behavior.
+      return OB_SUCCESS;
+    } else if (child.get_data_length() > INT32_MAX) {
+      return OB_SUCCESS;
+    } else {
+      JsonWireString string;
+      string.data_ = child.get_data();
+      string.length_ = static_cast<int64_t>(child.get_data_length());
+      string.escaped_length_ = string.length_;
+      if (nullptr == string.data_ && string.length_ != 0) {
+        ret = OB_ERR_NULL_VALUE;
+      } else {
+        if (string.length_ > 0) {
+          const char *cursor = string.data_;
+          const char *end = cursor + string.length_;
+          while (cursor != end) {
+            cursor = std::find_if(cursor, end, json_wire_needs_escape);
+            if (cursor != end) {
+              string.escaped_length_ += json_wire_short_escape(*cursor++) ? 1 : 5;
+            }
+          }
+        }
+        const int64_t entry_length = string.escaped_length_ + 2 + (i > 0 ? 2 : 0);
+        if (entry_length > INT32_MAX - text_length) {
+          // Keep the generic large-buffer path's limits and allocation behavior.
+          return OB_SUCCESS;
+        } else if (OB_FAIL(strings.push_back(string))) {
+        } else {
+          text_length += entry_length;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    const bool local = text_length <= ObMySQLCellValue::LOCAL_BUFFER_SIZE;
+    char *text = local ? out.get_local_buffer() : static_cast<char *>(allocator.alloc(text_length));
+    if (nullptr == text) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      char *dest = text;
+      *dest++ = '[';
+      for (int64_t i = 0; i < strings.count(); ++i) {
+        const JsonWireString &string = strings.at(i);
+        if (i > 0) {
+          *dest++ = ',';
+          *dest++ = ' ';
+        }
+        *dest++ = '"';
+        if (string.escaped_length_ == string.length_) {
+          if (string.length_ > 0) {
+            MEMCPY(dest, string.data_, string.length_);
+            dest += string.length_;
+          }
+        } else {
+          const char *cursor = string.data_;
+          const char *end = cursor + string.length_;
+          while (cursor != end) {
+            const char *special = std::find_if(cursor, end, json_wire_needs_escape);
+            MEMCPY(dest, cursor, special - cursor);
+            dest += special - cursor;
+            cursor = special;
+            if (cursor != end) {
+              const unsigned char c = static_cast<unsigned char>(*cursor++);
+              *dest++ = '\\';
+              switch (c) {
+                case '\b': *dest++ = 'b'; break;
+                case '\t': *dest++ = 't'; break;
+                case '\n': *dest++ = 'n'; break;
+                case '\f': *dest++ = 'f'; break;
+                case '\r': *dest++ = 'r'; break;
+                case '"': *dest++ = '"'; break;
+                case '\\': *dest++ = '\\'; break;
+                default: {
+                  static const char hex[] = "0123456789abcdef";
+                  *dest++ = 'u';
+                  *dest++ = '0';
+                  *dest++ = '0';
+                  *dest++ = hex[c >> 4];
+                  *dest++ = hex[c & 0xf];
+                  break;
+                }
+              }
+            }
+          }
+        }
+        *dest++ = '"';
+      }
+      *dest++ = ']';
+      OB_ASSERT(dest - text == text_length);
+      if (local) {
+        ret = out.set_local_bytes(ObMySQLCellValueKind::LENENC_BYTES, static_cast<int32_t>(text_length));
+      } else {
+        out.set_borrowed_bytes(ObMySQLCellValueKind::LENENC_BYTES, text, text_length);
+      }
+      handled = OB_SUCC(ret);
     }
   }
   return ret;
@@ -456,6 +670,7 @@ int ObSMUtils::build_cell_value(const ObObj &obj, MYSQL_PROTOCOL_TYPE type,
       break;
     }
     case ObJsonTC: {
+      JsonWireProfileScope profile;
       const ObString &value = obj.get_string();
       if (0 == value.length()) {
         out.kind_ = ObMySQLCellValueKind::LEGACY_LENENC_NULL;
@@ -469,7 +684,12 @@ int ObSMUtils::build_cell_value(const ObObj &obj, MYSQL_PROTOCOL_TYPE type,
         ObIJsonBase *json_base = &json_bin;
         ObJsonBuffer json_buf(&scratch_allocator);
         json_bin.set_seek_flag(true);
+        bool handled = false;
         if (OB_FAIL(json_bin.reset_iter())) {
+        } else if (!profile.force_generic()
+                   && OB_FAIL(try_flat_json_string_array(json_bin, scratch_allocator, out, handled))) {
+        } else if (handled) {
+          profile.mark_flat();
         } else if (OB_FAIL(json_base->print(json_buf, true, value.length()))) {
         } else if (json_buf.length() <= ObMySQLCellValue::LOCAL_BUFFER_SIZE
                    || json_buf.capacity() > INT32_MAX) {

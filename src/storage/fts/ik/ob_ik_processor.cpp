@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 
 #include "storage/fts/ik/ob_ik_processor.h"
+#include "storage/fts/ik/ob_ik_ac_matcher.h"
+#include "lib/container/ob_se_array.h"
 
 #include "lib/allocator/ob_allocator.h"
 #include "lib/charset/ob_charset.h"
@@ -31,6 +33,127 @@ namespace oceanbase
 {
 namespace storage
 {
+class IKDecodedChars
+{
+public:
+  struct Char {
+    ob_wc_t unicode_;
+    uint32_t offset_;
+    uint8_t length_;
+    ObFTCharUtil::CharType type_;
+  };
+  static constexpr int64_t MAX_DOCUMENT_BYTES = 64 * 1024;
+  common::ObSEArray<Char, 128> chars_;
+  IKACMatcher::Lease matcher_;
+  uint64_t generation_ = 0;
+  bool attempted_ = false;
+  int64_t current_ = 0;
+  int64_t lookup_ = 0;
+  uint32_t state_ = 0;
+  void reuse()
+  {
+    chars_.reuse();
+    current_ = lookup_ = 0;
+    state_ = 0;
+  }
+};
+
+bool TokenizeContext::enable_default_pipeline(uint64_t generation)
+{
+  decoded_enabled_ = false;
+  if (cursor_ != 0 || fulltext_len_ <= 0 || fulltext_len_ > IKDecodedChars::MAX_DOCUMENT_BYTES
+      || ObCharset::charset_type_by_coll(coll_type_) != CHARSET_UTF8MB4) { return false; }
+  if (nullptr == decoded_) { decoded_ = OB_NEW(IKDecodedChars, "IKDecoded"); }
+  if (nullptr == decoded_) { return false; }
+  decoded_->reuse();
+  if (!decoded_->attempted_ || decoded_->generation_ != generation) {
+    decoded_->matcher_ = IKACMatcher::acquire(generation);
+    decoded_->generation_ = generation;
+    decoded_->attempted_ = true;
+  }
+  if (!decoded_->matcher_ || OB_SUCCESS != decoded_->chars_.reserve(fulltext_len_)) { return false; }
+  const auto *begin = reinterpret_cast<const unsigned char *>(fulltext_);
+  const auto *cursor = begin;
+  const auto *end = begin + fulltext_len_;
+  while (cursor < end) {
+    ob_wc_t unicode = 0;
+    // Match classify_first_char's strict UTF8 decoder (including surrogate
+    // rejection). Any failure replays the untouched document through the DAT.
+    const int bytes = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(cursor, end, unicode);
+    if (bytes <= 0) { decoded_->reuse(); return false; }
+    ObFTCharUtil::CharType type = ObFTCharUtil::CharType::USELESS;
+    if (ObUnicodeBlockUtils::is_alpha(unicode)) { type = ObFTCharUtil::CharType::ENGLISH_LETTER; }
+    else if (ObUnicodeBlockUtils::is_arabic(unicode)) { type = ObFTCharUtil::CharType::ARABIC_LETTER; }
+    else if (ObUnicodeBlockUtils::is_chinese(unicode)) { type = ObFTCharUtil::CharType::CHINESE; }
+    else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) { type = ObFTCharUtil::CharType::OTHER_CJK; }
+    IKDecodedChars::Char item{unicode, static_cast<uint32_t>(cursor - begin),
+                             static_cast<uint8_t>(bytes), type};
+    if (OB_SUCCESS != decoded_->chars_.push_back(item)) { decoded_->reuse(); return false; }
+    cursor += bytes;
+  }
+  decoded_enabled_ = true;
+  next_char_len_ = decoded_->chars_.at(0).length_;
+  next_char_type_ = decoded_->chars_.at(0).type_;
+  return true;
+}
+
+void TokenizeContext::disable_default_pipeline()
+{
+  decoded_enabled_ = false;
+  if (nullptr != decoded_) { decoded_->reuse(); }
+}
+
+bool TokenizeContext::default_pipeline_enabled() const { return decoded_enabled_; }
+ob_wc_t TokenizeContext::current_unicode() const { return decoded_->chars_.at(decoded_->current_).unicode_; }
+int64_t TokenizeContext::current_char_index() const { return decoded_->current_; }
+int64_t TokenizeContext::char_offset(int64_t index) const { return decoded_->chars_.at(index).offset_; }
+
+int TokenizeContext::match_main_dictionary()
+{
+  if (next_char_type_ == ObFTCharUtil::CharType::USELESS) {
+    decoded_->state_ = 0;
+    return OB_SUCCESS;
+  }
+  decoded_->state_ = decoded_->matcher_->advance(decoded_->state_, current_unicode());
+  return decoded_->matcher_->output(decoded_->state_, *this);
+}
+
+int TokenizeContext::read_char(int64_t offset, int64_t &length, ObFTCharUtil::CharType &type)
+{
+  int ret = OB_SUCCESS;
+  if (!decoded_enabled_) {
+    if (OB_FAIL(ObCharset::first_valid_char(coll_type_, fulltext_ + offset,
+                                           fulltext_len_ - offset, length))) {
+    } else { ret = ObFTCharUtil::classify_first_char(coll_type_, fulltext_ + offset, length, type); }
+  } else {
+    if (decoded_->lookup_ >= decoded_->chars_.count()
+        || decoded_->chars_.at(decoded_->lookup_).offset_ > offset) { decoded_->lookup_ = 0; }
+    while (decoded_->lookup_ < decoded_->chars_.count()
+        && decoded_->chars_.at(decoded_->lookup_).offset_ < offset) { ++decoded_->lookup_; }
+    if (decoded_->lookup_ >= decoded_->chars_.count()
+        || decoded_->chars_.at(decoded_->lookup_).offset_ != offset) { ret = OB_ERR_UNEXPECTED; }
+    else {
+      const IKDecodedChars::Char &item = decoded_->chars_.at(decoded_->lookup_);
+      length = item.length_;
+      type = item.type_;
+    }
+  }
+  return ret;
+}
+
+int TokenizeContext::ignore_single_cjk(int64_t offset, int64_t length, bool &ignore)
+{
+  if (!decoded_enabled_) {
+    return ObFTCharUtil::is_ignore_single_cjk(coll_type_, fulltext_ + offset, length, ignore);
+  }
+  ObFTCharUtil::CharType type;
+  int ret = read_char(offset, length, type);
+  if (OB_SUCCESS == ret) {
+    ignore = ObUnicodeBlockUtils::check_ignore_as_single(decoded_->chars_.at(decoded_->lookup_).unicode_);
+  }
+  return ret;
+}
+
 int ObIIKProcessor::process(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
@@ -71,6 +194,7 @@ int TokenizeContext::init()
 int TokenizeContext::restart(const char *fulltext, int64_t fulltext_len, bool is_smart)
 {
   reset_resource();
+  disable_default_pipeline();
   fulltext_ = fulltext;
   fulltext_len_ = fulltext_len;
   is_smart_ = is_smart;
@@ -114,6 +238,16 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
+  if (decoded_enabled_) {
+    while (decoded_->current_ < decoded_->chars_.count()
+        && decoded_->chars_.at(decoded_->current_).offset_ < cursor_) { ++decoded_->current_; }
+    if (decoded_->current_ >= decoded_->chars_.count()
+        || decoded_->chars_.at(decoded_->current_).offset_ != cursor_) { return OB_ERR_UNEXPECTED; }
+    const IKDecodedChars::Char &item = decoded_->chars_.at(decoded_->current_);
+    next_char_len_ = item.length_;
+    next_char_type_ = item.type_;
+    return ret;
+  }
   if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
@@ -184,6 +318,7 @@ int TokenizeContext::add_token(const char *fulltext,
 
 TokenizeContext::~TokenizeContext()
 {
+  if (nullptr != decoded_) { OB_DELETE(IKDecodedChars, "IKDecoded", decoded_); }
   token_list_.reset();
   result_list_.reset();
 }

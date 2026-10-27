@@ -17,7 +17,7 @@ name = "sql_nio"
 # staticlib -> libsql_nio.a for linking into C++ (the future ObSqlNio shell);
 # rlib      -> Rust consumers.
 crate-type = ["staticlib", "rlib"]
-test = false
+test = true
 
 [dependencies]
 # mio = epoll (Linux) / kqueue (macOS) / IOCP (Windows), no async runtime.

@@ -90,7 +90,7 @@ def statements(inputs, oracle):
     return result
 
 
-def run(command, sql, timeout):
+def run(command, sql, timeout, expected_raw=None):
     process = subprocess.run(command, input="SET NAMES utf8mb4;\n" + "\n".join(sql),
                              text=True, capture_output=True, timeout=timeout)
     if process.returncode:
@@ -100,6 +100,8 @@ def run(command, sql, timeout):
         key, raw = line.split("\t", 1)
         if key in result:
             raise AssertionError(f"duplicate result {key}")
+        if expected_raw is not None and key in expected_raw:
+            assert raw == expected_raw[key], ("flat JSON wire bytes", key, raw)
         # Preserve array order; binary layout equality is not required.
         result[key] = json.loads(raw)
     expected = sum(5 if "FROM (" in item else 1 for item in sql)
@@ -141,13 +143,21 @@ def main():
     wire_values = [None, True, 42, "", 'quote" slash\\ newline\n tab\t 数据库 😀',
                    [], {}, ["x" * 600, {"nested": [1, False, None]}],
                    {"large": "汉字" * 22000, "tail": "kept"}]
+    wire_values += [[chr(i) for i in range(32)] + ['"', '\\', '/', '\x7f', '数据库 é 😀 𠀀'],
+                    ['', ''], ['a'] * 15, ['b'] * 16, ['c'] * 17,
+                    ['汉字' * 22000], ['\x00' * 1024],
+                    ['prefix'] * 17 + [{'nested': ['tail', None]}]]
+    wire_values += [['x' * n] for n in (59, 60, 61, 127, 128, 255, 256, 65535, 65536)]
     wire_sql = []
     expected_wire = {}
+    expected_wire_bytes = {}
     for index, value in enumerate(wire_values):
         text = json.dumps(value, ensure_ascii=False)
         wire_sql.append(f"SELECT 'wire-{index}', CAST({literal(text)} AS JSON);")
         expected_wire[f"wire-{index}"] = value
-    assert run(command + ["--raw"], wire_sql, args.timeout) == expected_wire, "JSON wire payload changed"
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            expected_wire_bytes[f"wire-{index}"] = text
+    assert run(command + ["--raw"], wire_sql, args.timeout, expected_wire_bytes) == expected_wire, "JSON wire payload changed"
     multi = ["a" * 1024, {"escaped": 'a"b\\c\n'}, [None, True, "数据库"]]
     process = subprocess.run(command + ["--raw"], input="SET NAMES utf8mb4;\nSELECT " +
         ",".join(f"CAST({literal(json.dumps(v, ensure_ascii=False))} AS JSON)" for v in multi) + ";\n",

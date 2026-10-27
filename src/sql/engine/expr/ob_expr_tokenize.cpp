@@ -16,6 +16,11 @@
 
 #include "sql/engine/expr/ob_expr_tokenize.h"
 #include <mutex>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
@@ -34,6 +39,7 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "data_plane/fts/ob_fts_literal.h"
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_json_func_helper.h" // file not self-contained, there're logs inside.
@@ -44,11 +50,102 @@ namespace sql
 {
 namespace
 {
+// Diagnostic only: flags are immutable for a process and ignored unless profiling
+// is explicitly enabled. Disabled calls never read the thread CPU clock.
+struct TokenizeCpuConfig
+{
+  static bool env_enabled(const char *name)
+  {
+    const char *value = std::getenv(name);
+    return nullptr != value && 0 == std::strcmp(value, "1");
+  }
+  const bool enabled_ = env_enabled("FTS_TOKENIZE_PROFILE");
+  const bool force_legacy_ = enabled_ && env_enabled("FTS_TOKENIZE_PROFILE_FORCE_LEGACY");
+  const bool no_ac_ = enabled_ && env_enabled("FTS_TOKENIZE_PROFILE_NO_AC");
+};
+
+class TokenizeCpuProfile
+{
+public:
+  explicit TokenizeCpuProfile(const int &status) : config_(config()), status_(status)
+  {
+    start_ = stamp();
+  }
+  ~TokenizeCpuProfile()
+  {
+    if (!config_.enabled_) { return; }
+    const uint64_t total = elapsed(start_);
+    static Totals totals[6];
+    Totals &sum = totals[parser_ + (all_ ? 3 : 0)];
+    sum.total_.fetch_add(total, std::memory_order_relaxed);
+    sum.parse_.fetch_add(parse_ns_, std::memory_order_relaxed);
+    sum.pack_.fetch_add(pack_ns_, std::memory_order_relaxed);
+    sum.release_.fetch_add(release_ns_, std::memory_order_relaxed);
+    if (fallback_) { sum.fallback_.fetch_add(1, std::memory_order_relaxed); }
+    if (OB_SUCCESS != status_) { sum.errors_.fetch_add(1, std::memory_order_relaxed); }
+    const uint64_t count = sum.calls_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count % 3000 == 0) {
+      const char *name = parser_ == 0 ? "ik" : parser_ == 1 ? "beng" : "other";
+      const char *mode = config_.force_legacy_ ? "C_legacy"
+          : config_.no_ac_ ? "B_dense_dat" : "A_dense_ac";
+      // One write per 3000 completed docs, independent of native log filtering.
+      // Concurrent snapshots are cumulative relaxed-atomic diagnostics; adjacent
+      // fields can include another document finishing during this read.
+      std::fprintf(stderr, "FTS_TOKENIZE_CPU {\"parser\":\"%s\",\"output\":\"%s\","
+          "\"mode\":\"%s\",\"calls\":%llu,\"total_cpu_ns\":%llu,"
+          "\"parse_cpu_ns\":%llu,\"pack_cpu_ns\":%llu,\"release_cpu_ns\":%llu,"
+          "\"fallback\":%llu,\"errors\":%llu}\n",
+          name, all_ ? "all" : "default", mode, static_cast<unsigned long long>(count),
+          static_cast<unsigned long long>(sum.total_.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(sum.parse_.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(sum.pack_.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(sum.release_.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(sum.fallback_.load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(sum.errors_.load(std::memory_order_relaxed)));
+      std::fflush(stderr);
+    }
+  }
+  uint64_t stamp() const
+  {
+    if (!config_.enabled_) { return 0; }
+    timespec value{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value);
+    return static_cast<uint64_t>(value.tv_sec) * 1000000000ULL + value.tv_nsec;
+  }
+  uint64_t elapsed(uint64_t start) const { return config_.enabled_ ? stamp() - start : 0; }
+  bool force_legacy() const { return config_.force_legacy_; }
+  void set_parser(const ObString &name, bool all)
+  {
+    if (config_.enabled_) {
+      parser_ = name.length() >= 3 && 0 == MEMCMP(name.ptr(), "ik.", 3) ? 0
+          : name.length() >= 5 && 0 == MEMCMP(name.ptr(), "beng.", 5) ? 1 : 2;
+      all_ = all;
+    }
+  }
+  uint64_t parse_ns_ = 0;
+  uint64_t pack_ns_ = 0;
+  uint64_t release_ns_ = 0;
+  bool fallback_ = false;
+private:
+  struct Totals
+  {
+    std::atomic<uint64_t> total_{0}, parse_{0}, pack_{0}, release_{0};
+    std::atomic<uint64_t> calls_{0}, fallback_{0}, errors_{0};
+  };
+  static const TokenizeCpuConfig &config() { static const TokenizeCpuConfig value; return value; }
+  const TokenizeCpuConfig &config_;
+  const int &status_;
+  uint64_t start_ = 0;
+  int parser_ = 2;
+  bool all_ = false;
+};
+
 // DEFAULT output contains only strings. Serialize that flat array into the
 // expression-owned payload, without creating a JSON tree or a temporary binary.
 // Keep the generic tree/serializer path for ALL and for nonconstant config.
+template <typename Terms>
 int pack_token_array_binary(const ObExpr &expr, ObEvalCtx &ctx,
-                            const storage::ObFTWordMap &words, ObDatum &datum)
+                            const Terms &words, ObDatum &datum)
 {
   int ret = OB_SUCCESS;
   const uint64_t count = words.size();
@@ -316,6 +413,8 @@ private:
 int ObExprTokenize::eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &datum)
 {
   int ret = OB_SUCCESS;
+  // Construct before the lease so total CPU includes its final cleanup.
+  TokenizeCpuProfile profile(ret);
   ObEvalCtx::TempAllocGuard key_guard(ctx);
   MultimodeAlloctor key_allocator(key_guard.get_allocator());
   ObDatum *fulltext = nullptr;
@@ -353,12 +452,15 @@ int ObExprTokenize::eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &d
     TokenizePool &pool_;
     int64_t slot_id_;
     TokenizeContext *state_;
+    TokenizeCpuProfile &profile_;
     ~Lease()
     {
+      const uint64_t start = profile_.stamp();
       if (slot_id_ >= 0) { pool_.release(slot_id_, state_); }
       else { OB_DELETE(TokenizeContext, "TokenizeLocal", state_); }
+      profile_.release_ns_ += profile_.elapsed(start);
     }
-  } lease{pool, slot_id, state};
+  } lease{pool, slot_id, state, profile};
   {
     ObEvalCtx::TempAllocGuard guard(ctx);
     ObArenaAllocator &tmp = guard.get_allocator();
@@ -369,7 +471,8 @@ int ObExprTokenize::eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &d
       if (OB_FAIL(parse_param(expr, ctx, tmp, param))) {
       } else if (OB_FAIL(state->helper_.init(&state->document_allocator_,
                                            param.parser_name_, param.parsed_properties_, true))) {
-      } else if (OB_FAIL(state->words_.create(bucket_count, ObMemAttr("TokenizeWords")))) {
+      } else if (param.output_mode_ == TokenizeParam::ALL
+          && OB_FAIL(state->words_.create(bucket_count, ObMemAttr("TokenizeWords")))) {
         state->helper_.reset();
       } else {
         state->configured_ = true;
@@ -380,21 +483,51 @@ int ObExprTokenize::eval_reusable(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &d
     }
     int64_t doc_len = 0;
     ObIJsonBase *json = nullptr;
-    if (OB_SUCC(ret) && !param.fulltext_.empty()
-        && OB_FAIL(state->helper_.segment(param.meta_, param.fulltext_.ptr(),
-                                         param.fulltext_.length(), doc_len, state->words_))) {
+    profile.set_parser(param.parser_name_, param.output_mode_ == TokenizeParam::ALL);
+    const uint64_t parse_start = profile.stamp();
+    bool unique_output = param.output_mode_ == TokenizeParam::DEFAULT && !profile.force_legacy();
+    if (OB_SUCC(ret) && unique_output) {
+      ret = state->unique_terms_.start(common::hash::cal_next_prime(bucket_count),
+                                      param.fulltext_.ptr(), param.fulltext_.length());
+      bool fallback = false;
+      if (OB_SUCC(ret) && !param.fulltext_.empty()) {
+        ret = state->helper_.segment_unique(param.meta_, param.fulltext_.ptr(),
+                                           param.fulltext_.length(), state->unique_terms_, fallback,
+                                           param.builtin_ik_dictionary_);
+      }
+      if (fallback) {
+        profile.fallback_ = true;
+        state->unique_terms_.reuse();
+        unique_output = false;
+      }
     }
+    if (OB_SUCC(ret) && !unique_output && !state->words_.created()) {
+      ret = state->words_.create(bucket_count, ObMemAttr("TokenizeWords"));
+    }
+    if (OB_SUCC(ret) && !unique_output && !param.fulltext_.empty()) {
+      ret = state->helper_.segment(param.meta_, param.fulltext_.ptr(),
+                                  param.fulltext_.length(), doc_len, state->words_);
+    }
+    profile.parse_ns_ += profile.elapsed(parse_start);
+    const uint64_t pack_start = profile.stamp();
     if (OB_SUCC(ret)) {
       if (param.output_mode_ == TokenizeParam::DEFAULT) {
-        ret = pack_token_array_binary(expr, ctx, state->words_, datum);
+        ret = unique_output
+            ? pack_token_array_binary(expr, ctx, state->unique_terms_, datum)
+            : pack_token_array_binary(expr, ctx, state->words_, datum);
       } else if (OB_FAIL(state->helper_.make_detail_json(state->words_, doc_len, json))) {
       } else {
         ret = ObJsonExprHelper::pack_json_res(expr, ctx, tmp, json, datum);
       }
     }
+    profile.pack_ns_ += profile.elapsed(pack_start);
     // Both output paths finish in expr-owned storage, so no token or JSON
     // pointers escape this invocation, including on empty input and errors.
-    if (slot_id < 0) { state->clear_document(); }
+    if (slot_id < 0) {
+      const uint64_t release_start = profile.stamp();
+      state->clear_document();
+      profile.release_ns_ += profile.elapsed(release_start);
+    }
   }
   return ret;
 }
@@ -715,6 +848,23 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parsed_properties_.read_from_props(parser, parser_properties))) {
+  }
+  builtin_ik_dictionary_ = true;
+  if (OB_SUCC(ret) && parser.is_ik() && !properties.empty()) {
+    // Do not infer a custom/table dictionary's immutability from generation.
+    // Missing values mean the same defaults inserted by property rebuilding.
+    ObString value;
+    int check = parser_properties.config_get_dict_table(value);
+    builtin_ik_dictionary_ = check == OB_SEARCH_NOT_FOUND || (check == OB_SUCCESS
+        && value == ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE));
+    value.reset();
+    check = parser_properties.config_get_quantifier_table(value);
+    builtin_ik_dictionary_ = builtin_ik_dictionary_ && (check == OB_SEARCH_NOT_FOUND || (check == OB_SUCCESS
+        && value == ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE)));
+    value.reset();
+    check = parser_properties.config_get_stopword_table(value);
+    builtin_ik_dictionary_ = builtin_ik_dictionary_ && (check == OB_SEARCH_NOT_FOUND || (check == OB_SUCCESS
+        && value == ObString(storage::ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE)));
   }
 
   return ret;

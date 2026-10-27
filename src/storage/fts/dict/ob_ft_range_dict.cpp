@@ -16,6 +16,9 @@
 
 #include "storage/fts/dict/ob_ft_range_dict.h"
 #include "share/rc/ob_server_runtime.h"
+#include <cstdlib>
+#include <cstring>
+#include "lib/time/ob_time_utility.h"
 
 #include "storage/fts/dict/ob_ik_dic.h"
 #include "lib/allocator/page_arena.h"
@@ -33,6 +36,7 @@
 #include "storage/fts/dict/ob_ft_dat_dict.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
+#include "lib/charset/ob_charset_string_helper.h"
 #include "storage/fts/dict/ob_ft_dict_iterator.h"
 #include "storage/fts/dict/ob_ft_dict_table_iter.h"
 #include "storage/fts/dict/ob_ft_trie.h"
@@ -378,7 +382,107 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+void ObFTRangeDict::rebuild_root_index(bool verify)
+{
+  const int64_t build_started = common::ObTimeUtility::current_time();
+  bmp_root_ranges_.reset();
+  if (desc_.name_ != ObString("main_dict") || desc_.type_ != ObFTDictType::DICT_IK_MAIN || desc_.charset_ != CHARSET_UTF8MB4
+      || desc_.coll_type_ != CS_TYPE_UTF8MB4_BIN || range_dicts_.size() < 2) { return; }
+  // UTF8_BIN strcmp uses strnncoll_mb_bin (memcmp, no padding/folding).
+  // Canonical single-codepoint UTF8 lexical order equals codepoint order.
+  // Validate every boundary first so an empty slot is an exact negative hit.
+  for (int64_t i = 0; i < range_dicts_.size(); ++i) {
+    const ObString endpoints[] = {range_dicts_[i].start_.get_word(), range_dicts_[i].end_.get_word()};
+    ob_wc_t codes[2] = {0, 0};
+    for (int j = 0; j < 2; ++j) {
+      const auto *begin = reinterpret_cast<const unsigned char *>(endpoints[j].ptr());
+      const int bytes = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(
+          begin, begin + endpoints[j].length(), codes[j]);
+      unsigned char canonical[4];
+      const int encoded = common::ob_charset_encode_unicode<CHARSET_UTF8MB4>(
+          codes[j], canonical, canonical + sizeof(canonical));
+      if (bytes <= 0 || bytes != endpoints[j].length() || encoded != bytes
+          || 0 != MEMCMP(canonical, begin, bytes)) { return; }
+    }
+    if (codes[0] > codes[1]) { return; }
+  }
+  if (OB_SUCCESS != bmp_root_ranges_.prepare_allocate(65536)) { bmp_root_ranges_.reset(); return; }
+  MEMSET(bmp_root_ranges_.get_data(), -1, 65536 * sizeof(int32_t));
+  for (int64_t i = 0; i < range_dicts_.size(); ++i) {
+    const ObString first = range_dicts_[i].start_.get_word();
+    const ObString last = range_dicts_[i].end_.get_word();
+    ob_wc_t begin_code = 0, end_code = 0;
+    const auto *begin = reinterpret_cast<const unsigned char *>(first.ptr());
+    const auto *end = reinterpret_cast<const unsigned char *>(last.ptr());
+    common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(begin, begin + first.length(), begin_code);
+    common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(end, end + last.length(), end_code);
+    for (ob_wc_t code = begin_code; code <= end_code && code < 65536; ++code) {
+      if (bmp_root_ranges_.at(code) < 0) { bmp_root_ranges_.at(code) = i; }
+    }
+  }
+  // This optional diagnostic runs only before this dictionary is published.
+  // Rebuilding twice also proves the table owns no stale range-vector pointers.
+  const char *flag = std::getenv("FTS_ROOT_RANGE_INDEX_VERIFY");
+  if (verify && nullptr != flag && 0 == std::strcmp(flag, "1")) {
+    const int64_t started = common::ObTimeUtility::current_time();
+    const int64_t cold_build_us = started - build_started;
+    bool valid = verify_root_index();
+    rebuild_root_index(false);
+    valid = valid && verify_root_index();
+    LOG_INFO("fts root range index verification", K(valid), K(cold_build_us),
+             "ranges", range_dicts_.size(), "payload_bytes", 65536 * sizeof(int32_t),
+             "verify_rebuild_us", common::ObTimeUtility::current_time() - started);
+    if (!valid) { bmp_root_ranges_.reset(); }
+  }
+}
+
+bool ObFTRangeDict::verify_root_index() const
+{
+  if (bmp_root_ranges_.count() != 65536) { return false; }
+  int64_t negatives = 0;
+  auto compare = [&](const ObString &word) {
+    ObIFTDict *indexed = nullptr, *legacy = nullptr;
+    const int fast_ret = find_first_char_range(word, indexed);
+    const int old_ret = find_first_char_range_legacy(word, legacy);
+    if (old_ret == OB_ENTRY_NOT_EXIST) { ++negatives; }
+    return fast_ret == old_ret && (old_ret != OB_SUCCESS || indexed == legacy);
+  };
+  for (ob_wc_t code = 0; code < 65536; ++code) {
+    if (code >= 0xD800 && code <= 0xDFFF) { continue; }
+    unsigned char bytes[4];
+    const int length = common::ob_charset_encode_unicode<CHARSET_UTF8MB4>(code, bytes, bytes + sizeof(bytes));
+    if (length <= 0 || !compare(ObString(length, reinterpret_cast<const char *>(bytes)))) { return false; }
+  }
+  // Supplementary characters and malformed/noncanonical keys must use legacy.
+  const unsigned char cases[][4] = {{0xF0,0x90,0x80,0x80}, {0xF4,0x8F,0xBF,0xBF},
+      {0xC0,0x80,0,0}, {0xED,0xA0,0x80,0}, {0x80,0,0,0}, {0xE4,0xB8,0,0}, {0x61,0x62,0,0}};
+  const int lengths[] = {4,4,2,3,1,2,2};
+  for (int64_t i = 0; i < static_cast<int64_t>(sizeof(lengths) / sizeof(lengths[0])); ++i) {
+    if (!compare(ObString(lengths[i], reinterpret_cast<const char *>(cases[i])))) { return false; }
+  }
+  LOG_INFO("fts root range exhaustive comparison", "valid_bmp", 65536 - 2048,
+           K(negatives), "fallback_cases", sizeof(lengths) / sizeof(lengths[0]));
+  return true;
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
+{
+  if (bmp_root_ranges_.count() != 0 && single_word.length() > 0 && single_word.length() <= 3) {
+    ob_wc_t unicode = 0;
+    const auto *begin = reinterpret_cast<const unsigned char *>(single_word.ptr());
+    const int bytes = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(
+        begin, begin + single_word.length(), unicode);
+    if (bytes == single_word.length() && unicode < 65536) {
+      const int32_t index = bmp_root_ranges_.at(unicode);
+      if (index < 0) { return OB_ENTRY_NOT_EXIST; }
+      dict = range_dicts_[index].dict_;
+      return OB_SUCCESS;
+    }
+  }
+  return find_first_char_range_legacy(single_word, dict);
+}
+
+int ObFTRangeDict::find_first_char_range_legacy(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
@@ -405,6 +509,10 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
 {
   int ret = OB_SUCCESS;
+  // Construction/rebuilding happens before publication under the dictionary
+  // hub lock. Drop the old owned readers and their index together; no process-
+  // global memoized pointer can survive allocator address reuse.
+  destroy();
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {
@@ -422,6 +530,7 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       }
     }
   }
+  if (OB_SUCC(ret)) { rebuild_root_index(); }
   return ret;
 }
 

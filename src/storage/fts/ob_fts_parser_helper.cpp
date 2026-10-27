@@ -15,10 +15,13 @@
  */
 
 #include "object/ob_object.h"
+#include <cstdlib>
+#include <cstring>
 #include "storage/fts/ob_fts_struct.h"
 #define USING_LOG_PREFIX STORAGE_FTS
 
 #include "storage/fts/ob_fts_parser_helper.h"
+#include "data_plane/fts/ob_fts_unique_terms.h"
 
 #include "common/json_type/ob_json_tree.h"
 #include "share/ob_force_print_log.h"
@@ -35,6 +38,132 @@ namespace oceanbase
 {
 namespace storage
 {
+
+static bool ft_tokenize_profile_no_ac()
+{
+  static const bool disabled = []() {
+    const char *profile = std::getenv("FTS_TOKENIZE_PROFILE");
+    const char *flag = std::getenv("FTS_TOKENIZE_PROFILE_NO_AC");
+    return nullptr != profile && 0 == std::strcmp(profile, "1")
+        && nullptr != flag && 0 == std::strcmp(flag, "1");
+  }();
+  return disabled;
+}
+
+// ob_casedn_utf8mb4 decodes, applies caseinfo->page[wc].tolower and
+// reencodes. For valid CJK characters whose actual table entry is identity,
+// both conversion and its temporary allocation can be skipped. Keep all other
+// non-ASCII scripts/charsets on ObCharset::tolower (including invalid UTF-8).
+static bool ft_unique_lower_identity(const ObCharsetInfo *cs, bool utf8,
+                                     const char *word, int64_t length)
+{
+  if (cs->mbminlen != 1) { return false; }
+  const unsigned char *cursor = reinterpret_cast<const unsigned char *>(word);
+  const unsigned char *end = cursor + length;
+  while (cursor < end) {
+    if (*cursor < 128) {
+      if (*cursor >= 'A' && *cursor <= 'Z') { return false; }
+      ++cursor;
+    } else {
+      if (!utf8 || nullptr == cs->caseinfo) { return false; }
+      ob_wc_t wc = 0;
+      const int bytes = cs->cset->mb_wc(cs, &wc, cursor, end);
+      if (bytes <= 0 || !((wc >= 0x3400 && wc <= 0x4DBF)
+          || (wc >= 0x4E00 && wc <= 0x9FFF) || (wc >= 0x20000 && wc <= 0x2FA1F))) {
+        return false;
+      }
+      if (wc <= cs->caseinfo->maxchar) {
+        const ObUnicaseInfoChar *page = cs->caseinfo->page[wc >> 8];
+        if (nullptr != page && page[wc & 0xFF].tolower != wc) { return false; }
+      }
+      cursor += bytes;
+    }
+  }
+  return true;
+}
+
+void FTUniqueTerms::reuse()
+{
+  entries_.reuse();
+  heads_.reuse();
+  input_ = nullptr;
+  input_length_ = 0;
+  slab_ = nullptr;
+  remaining_ = owned_bytes_ = 0;
+  overflow_ = false;
+  if (strings_.total() > 256 * 1024) { strings_.reset(); }
+  else { strings_.reuse(); }
+}
+
+int FTUniqueTerms::start(int64_t legacy_bucket_count, const char *input, int64_t length)
+{
+  reuse();
+  int ret = OB_SUCCESS;
+  input_ = input;
+  input_length_ = length;
+  if (legacy_bucket_count <= 0 || legacy_bucket_count > 2048) {
+    overflow_ = true;
+  } else if (OB_FAIL(heads_.prepare_allocate(legacy_bucket_count))) {
+  } else {
+    MEMSET(heads_.get_data(), -1, legacy_bucket_count * sizeof(int32_t));
+  }
+  return ret;
+}
+
+int FTUniqueTerms::add(const ObFTWord &word, const ObObjMeta &meta)
+{
+  int ret = OB_SUCCESS;
+  uint64_t hash = 0;
+  if (OB_FAIL(word.hash(hash))) {
+  } else {
+    const int64_t bucket = hash % heads_.count();
+    int32_t index = heads_.at(bucket);
+    while (index >= 0 && !(entries_.at(index).first == word)) {
+      index = entries_.at(index).next_;
+    }
+    const ObString spelling = word.get_word().get_string();
+    if (index >= 0 && entries_.at(index).first.get_word().get_string() == spelling) {
+      // Keep stable storage when the spelling itself has not changed.
+    } else if (index < 0 && entries_.count() >= MAX_TERMS) {
+      overflow_ = true;
+    } else {
+      const char *ptr = spelling.ptr();
+      const uintptr_t begin = reinterpret_cast<uintptr_t>(input_);
+      const uintptr_t value = reinterpret_cast<uintptr_t>(ptr);
+      const bool borrowed = value >= begin && value - begin <= static_cast<uint64_t>(input_length_)
+          && static_cast<uint64_t>(spelling.length()) <= input_length_ - (value - begin);
+      if (!borrowed) {
+        if (spelling.length() > MAX_OWNED_BYTES - owned_bytes_) {
+          overflow_ = true;
+        } else {
+          if (remaining_ < spelling.length()) {
+            remaining_ = MAX(4096, spelling.length());
+            slab_ = static_cast<char *>(strings_.alloc(remaining_));
+            if (nullptr == slab_) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+          }
+          if (OB_SUCC(ret)) {
+            MEMCPY(slab_, ptr, spelling.length());
+            ptr = slab_;
+            slab_ += spelling.length();
+            remaining_ -= spelling.length();
+            owned_bytes_ += spelling.length();
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !overflow_) {
+        ObFTWord retained(spelling.length(), ptr, meta);
+        if (index >= 0) {
+          entries_.at(index).first = retained; // Last spelling; keep chain position.
+        } else {
+          Entry entry{retained, heads_.at(bucket)};
+          ret = entries_.push_back(entry);
+          if (OB_SUCC(ret)) { heads_.at(bucket) = entries_.count() - 1; }
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 const char *ObFTParser::NAME_STR[ObFTParser::ParserType::FTP_MAX] = {
 #define FT_PARSER_TYPE(ftp_type, parser_name) #parser_name,
@@ -277,6 +406,14 @@ public:
     }
     return ret;
   }
+  bool enable_default_pipeline(uint64_t generation)
+  { return !is_ik_ || ik_.enable_default_pipeline(generation); }
+  int next_view(ObITokenIterator *iter, const char *&word, int64_t &length,
+                int64_t &chars, int64_t &freq)
+  {
+    return is_ik_ ? iter->get_next_token(word, length, chars, freq)
+                  : beng_.get_next_token_view(word, length, chars, freq);
+  }
   int64_t retained_bytes() const { return objects_.total() + scratch_.total(); }
   void finish()
   {
@@ -477,6 +614,94 @@ int ObFTParseHelper::segment(
   }
   LOG_DEBUG("ft parse segment", K(ret), K(type), K(add_word_flag_), K(parser_name_),
       K(ObString(fulltext_len, fulltext)), K(words.size()));
+  return ret;
+}
+
+int ObFTParseHelper::segment_unique(const ObObjMeta &meta, const char *fulltext,
+                                    int64_t fulltext_len, FTUniqueTerms &terms,
+                                    bool &fallback, bool builtin_ik_dictionary) const
+{
+  int ret = OB_SUCCESS;
+  fallback = false;
+  const ObCharsetInfo *cs = ObCharset::get_charset(meta.get_collation_type());
+  if (!is_inited_) { return OB_NOT_INIT; }
+  if (meta.get_collation_type() == CS_TYPE_INVALID
+      || meta.get_collation_type() >= CS_TYPE_PINYIN_BEGIN_MARK
+      || nullptr == cs || fulltext == nullptr || fulltext_len <= 0) { return OB_INVALID_ARGUMENT; }
+  if (parser_name_.is_ik() && (!builtin_ik_dictionary
+      || parser_name_.get_parser_version() != ObFTParser::BUILTIN_VERSION)) {
+    fallback = true;
+    return ret;
+  }
+  // Other parsers retain the ordinary path until they offer explicit view lifetimes.
+  if (nullptr == workspace_ || terms.overflow() || fulltext_len > 1024 * 1024) {
+    fallback = true;
+    return ret;
+  }
+  if (parser_name_.is_beng()) {
+    bool handled = false;
+    ret = try_beng_ascii_unique(cs, meta, parser_property_, fulltext, fulltext_len, terms, handled);
+    if (OB_FAIL(ret) || handled) {
+      fallback = terms.overflow();
+      return ret;
+    }
+  }
+  ObFTParserParam param;
+  param.allocator_ = allocator_;
+  param.cs_ = cs;
+  param.fulltext_ = fulltext;
+  param.ft_length_ = fulltext_len;
+  param.parser_version_ = parser_name_.get_parser_version();
+  param.ngram_token_size_ = parser_property_.ngram_token_size_;
+  param.min_ngram_size_ = parser_property_.min_ngram_token_size_;
+  param.max_ngram_size_ = parser_property_.max_ngram_token_size_;
+  param.ik_param_.mode_ = parser_property_.ik_mode_smart_
+      ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD;
+  ObITokenIterator *iter = nullptr;
+  ObArenaAllocator normalization("FTUniqueNorm");
+  const bool utf8 = ObCharset::charset_type_by_coll(meta.get_collation_type()) == CHARSET_UTF8MB4;
+  if (OB_FAIL(workspace_->open(param, iter))) {
+  } else if (parser_name_.is_ik() && !ft_tokenize_profile_no_ac()
+      && !workspace_->enable_default_pipeline(ObFTParseData::instance().generation())) {
+    // Unsupported input, cold-build/OOM/budget miss: no terms have escaped.
+    fallback = true;
+  } else {
+    while (OB_SUCC(ret) && !terms.overflow()) {
+      const char *word = nullptr;
+      int64_t length = 0, chars = 0, freq = 0;
+      if (OB_FAIL(workspace_->next_view(iter, word, length, chars, freq))) {
+      } else if (nullptr == word || length <= 0 || chars <= 0 || freq <= 0) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (add_word_flag_.min_max_word()
+          && (chars < parser_property_.min_token_size_ || chars > parser_property_.max_token_size_)) {
+      } else {
+        ObString normalized(length, word);
+        if (add_word_flag_.casedown()) {
+          if (!ft_unique_lower_identity(cs, utf8, word, length)) {
+            normalization.reuse();
+            ret = ObCharset::tolower(meta.get_collation_type(), ObString(length, word),
+                                     normalized, normalization);
+          }
+        }
+        // Preserve document views when case conversion leaves bytes unchanged
+        // (notably Chinese). The temporary conversion buffer can then be reused.
+        if (normalized.length() == length && 0 == MEMCMP(normalized.ptr(), word, length)) {
+          normalized.assign_ptr(word, length);
+        }
+        ObFTWord key(normalized.length(), normalized.ptr(), meta);
+        bool stop = false;
+        if (OB_SUCC(ret) && add_word_flag_.stopword()) {
+          ObStopWordChecker *checker = ObFTParseData::instance().stop_word_checker();
+          if (nullptr == checker) { ret = OB_ERR_UNEXPECTED; }
+          else { ret = checker->check_stopword(key, stop); }
+        }
+        if (OB_SUCC(ret) && !stop) { ret = terms.add(key, meta); }
+      }
+    }
+    if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+  }
+  if (terms.overflow()) { fallback = true; }
+  workspace_->finish();
   return ret;
 }
 

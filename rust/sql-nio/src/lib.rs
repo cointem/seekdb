@@ -45,6 +45,9 @@ mod handshake;
 mod login;
 mod packet;
 mod pump;
+mod profile;
+#[cfg(test)]
+mod tests;
 mod reactor;
 mod registry;
 mod request;

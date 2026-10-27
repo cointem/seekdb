@@ -174,6 +174,7 @@ pub(crate) struct ConnInner {
     pub(crate) out_pos: usize,
     pub(crate) want_write: bool,
     pub(crate) write_waiters: usize,
+    pub(crate) profile_commit_ns: u64,
     pub(crate) final_response: FinalResponseState,
     pub(crate) response: ResponseWriter,
     pub(crate) read_state: ReadState,

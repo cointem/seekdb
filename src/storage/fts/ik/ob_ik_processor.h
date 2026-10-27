@@ -27,6 +27,8 @@ namespace oceanbase
 {
 namespace storage
 {
+class IKDecodedChars;
+
 class TokenizeContext
 {
 public:
@@ -43,6 +45,7 @@ public:
   void release_document()
   {
     reset_resource();
+    disable_default_pipeline();
     fulltext_ = nullptr;
     fulltext_len_ = 0;
     cursor_ = 0;
@@ -76,6 +79,17 @@ public:
                 int64_t char_cnt,
                 ObIKTokenType type);
 
+  // Explicit DEFAULT-only builtin UTF8 pipeline; failure is an optimization miss.
+  bool enable_default_pipeline(uint64_t generation);
+  void disable_default_pipeline();
+  bool default_pipeline_enabled() const;
+  ob_wc_t current_unicode() const;
+  int64_t char_offset(int64_t index) const;
+  int64_t current_char_index() const;
+  int match_main_dictionary();
+  int read_char(int64_t offset, int64_t &length, ObFTCharUtil::CharType &type);
+  int ignore_single_cjk(int64_t offset, int64_t length, bool &ignore);
+
   ObFTSortList &token_list() { return token_list_; }
 
   ObList<ObIKToken, ObIAllocator> &result_list() { return result_list_; }
@@ -96,6 +110,8 @@ private:
   uint32_t handle_size_;
   bool is_smart_;
 
+  IKDecodedChars *decoded_ = nullptr;
+  bool decoded_enabled_ = false;
   ObFTSortList token_list_;
   ObList<ObIKToken, ObIAllocator> result_list_;
 

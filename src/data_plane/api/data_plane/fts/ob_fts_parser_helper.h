@@ -41,6 +41,7 @@ class ObStopWordChecker;
 class ObFTDictHub;
 class ObAddWord;
 class FTParserWorkspace;
+class FTUniqueTerms;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -186,6 +187,11 @@ public:
       const int64_t fulltext_len,
       int64_t &doc_length,
       ObFTWordMap &words) const;
+  // Explicit borrowed-output API for synchronous DEFAULT expression packing.
+  // On capacity overflow, caller must discard output and replay via segment().
+  int segment_unique(const common::ObObjMeta &meta, const char *fulltext,
+                     int64_t fulltext_len, FTUniqueTerms &terms, bool &fallback,
+                     bool builtin_ik_dictionary = false) const;
   int check_is_the_same(
       const common::ObString &parser_name,
       const common::ObString &parser_properties,

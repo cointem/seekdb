@@ -345,6 +345,7 @@ impl EventLoop {
                 out_pos: 0,
                 want_write: false,
                 write_waiters: 0,
+                profile_commit_ns: 0,
                 final_response: FinalResponseState::Idle,
                 response: ResponseWriter::new(),
                 read_state: ReadState::Login,
@@ -651,7 +652,9 @@ impl EventLoop {
                 return;
             }
 
+            let write_start = crate::profile::write_started(&mut g.profile_commit_ns);
             let drained = flush_buffer_locked(conn, &mut g);
+            crate::profile::write_finished(write_start);
             let mut failed = conn.err.load(Ordering::Acquire);
             if drained && g.want_write {
                 g.want_write = false;

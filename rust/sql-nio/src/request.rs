@@ -285,6 +285,58 @@ pub(crate) fn fail_flush_locked(conn: &Arc<Conn>, g: &mut ConnInner) -> bool {
     true
 }
 
+// One syscall only: the SQL worker never waits for socket readiness.
+pub(crate) fn write_once(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<usize> {
+    match writer.write(bytes) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(0)
+        }
+        result => result,
+    }
+}
+
+fn try_commit_write_locked(conn: &Arc<Conn>, g: &mut ConnInner) {
+    let remaining = g.outbuf.len() - g.out_pos;
+    if remaining == 0 {
+        return;
+    }
+    if g.tls.is_some()
+        || g.req_compressed
+        || g.want_write
+        || remaining > RESPONSE_BATCH_TARGET
+        || conn.err.load(Ordering::Acquire)
+        || conn.peer_closed.load(Ordering::Acquire)
+        || conn.close_requested.load(Ordering::Acquire)
+        || crate::profile::force_fallback()
+    {
+        crate::profile::fallback();
+        return;
+    }
+    let write_start = crate::profile::write_started(&mut g.profile_commit_ns);
+    let result = write_once(&mut g.sock, &g.outbuf[g.out_pos..]);
+    crate::profile::write_finished(write_start);
+    match result {
+        Ok(n) => {
+            g.out_pos += n;
+            if g.output_is_empty() {
+                g.clear_transport_output();
+                crate::profile::full();
+            } else {
+                crate::profile::partial();
+            }
+        }
+        Err(_) => {
+            crate::profile::error();
+            fail_flush_locked(conn, g);
+        }
+    }
+}
+
 pub(crate) fn flush_request(conn: &Arc<Conn>, generation: u64) -> Option<bool> {
     let mut g = conn.mu.lock().unwrap();
     valid_request_generation(conn, generation).then(|| flush_buffer_locked(conn, &mut g))
@@ -632,9 +684,9 @@ pub unsafe extern "C" fn nio_prepare_commit(
 /// clone keeps Conn alive even when this commit clears REQUEST_BUSY and a
 /// concurrent close subsequently releases the connection-scoped owner before
 /// this function returns. The delivery callback may still be returning on the
-/// io thread; Rust retains the body for it. Empty responses complete inline;
-/// non-empty output is handed to the owning reactor so socket writes stay
-/// concentrated on the SQL-NIO threads.
+/// io thread; Rust retains the body for it. Small plaintext responses may finish
+/// with one nonblocking write here. Remaining output retains its cursor and is
+/// handed to the owning reactor, which handles readiness and asynchronous completion.
 #[no_mangle]
 pub unsafe extern "C" fn nio_commit_request(
     connection_handle: *mut NioConnectionHandle,
@@ -661,6 +713,8 @@ pub unsafe extern "C" fn nio_commit_request(
                     take_mid_request_body_for_generation_locked(&mut g, continuation.generation);
                 let released_login = g.login.take();
                 g.final_response = FinalResponseState::Committed(continuation);
+                g.profile_commit_ns = crate::profile::commit_started();
+                try_commit_write_locked(&conn, &mut g);
 
                 let completed = take_final_completion_locked(&mut g);
                 let finished = completed

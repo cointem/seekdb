@@ -25,6 +25,7 @@
 #include "data_plane/fts/ob_fts_parser_name.h"
 #include "data_plane/fts/dict/ob_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
+#include "data_plane/fts/ob_fts_unique_terms.h"
 #include "common/json_type/ob_json_tree.h"
 
 namespace oceanbase
@@ -83,6 +84,7 @@ private:
     storage::ObDicLoaderHandle dictionary_loader_;
     ObCharsetType dictionary_charset_ = CHARSET_INVALID;
     uint64_t dictionary_generation_ = 0;
+    bool builtin_ik_dictionary_ = true;
     enum OUTPUT_MODE
     {
       DEFAULT,
@@ -107,7 +109,8 @@ private:
         token_nodes_[i].set_parent(nullptr);
       }
       token_count_ = 0;
-      words_.reuse(); // Drop keys before releasing their backing strings.
+      unique_terms_.reuse();
+      if (words_.created() && words_.size() > 0) { words_.reuse(); } // Drop keys before releasing their backing strings.
       if (document_allocator_.total() > 1024 * 1024) {
         document_allocator_.reset();
       } else {
@@ -119,6 +122,7 @@ private:
     common::ObArenaAllocator document_allocator_;
     storage::ObFTParseHelper helper_;
     storage::ObFTWordMap words_;
+    storage::FTUniqueTerms unique_terms_;
     bool configured_;
     ObString parser_key_;
     ObString options_key_;
