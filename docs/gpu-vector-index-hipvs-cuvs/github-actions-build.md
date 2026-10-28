@@ -42,7 +42,9 @@ SEEKDB_VECTOR_PROFILE=1 ./launch.sh --nodaemon --port 2982 \
 ```
 
 `manifest.json` records the exact source SHA, frozen baseline SHA, SDK digest,
-workflow SHA, workflow URL, Rust version and all bundled file hashes. Keep it
+workflow SHA, workflow URL, Rust version and all bundled file hashes.
+The bundle uses Ubuntu 24.04 libstdc++, checked for GLIBCXX_3.4.32;
+the build toolchain's GCC-12 libstdc++ is too old for the contest HIP/hipVS. Keep it
 with benchmark results. The startup verifier checks those hashes and resolves
 the real bridge's complete dynamic dependency graph before running seekdb.
 This does not prove actual GPU execution or Recall; run the profiling workload

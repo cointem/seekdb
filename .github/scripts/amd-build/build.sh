@@ -58,7 +58,12 @@ cp build_release/src/observer/seekdb "$OUT/bin/seekdb"
 # Debug symbols are not necessary for cloud performance experiments.
 strip --strip-debug "$OUT/bin/seekdb"
 cp "$SDK/bridge/libseekdb_cuvs_bridge.so" "$OUT/lib/"
-cp -L deps/3rd/usr/local/oceanbase/devtools/lib64/libstdc++.so.6 "$OUT/lib/"
+# ROCm 7.2.4/contest hipVS require GLIBCXX_3.4.32. The C++ build
+# toolchain's GCC-12 runtime only provides .30, so bundle the matching
+# Ubuntu-24 runtime instead of overriding the GPU runtime with an older ABI.
+cp -L /usr/lib/x86_64-linux-gnu/libstdc++.so.6 "$OUT/lib/"
+strings "$OUT/lib/libstdc++.so.6" > ci-logs/libstdcxx-symbols.txt
+grep -qx GLIBCXX_3.4.32 ci-logs/libstdcxx-symbols.txt
 patchelf --set-rpath '$ORIGIN/../lib:/opt/hipvs/lib:/opt/rocm/lib' "$OUT/bin/seekdb"
 patchelf --set-rpath '$ORIGIN:/opt/hipvs/lib:/opt/rocm/lib' "$OUT/lib/libseekdb_cuvs_bridge.so"
 cp tools/hipvs_bridge/{profile_workload.py,summarize_profile.py} "$OUT/tools/"
