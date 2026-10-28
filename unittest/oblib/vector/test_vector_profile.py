@@ -30,7 +30,14 @@ typedef struct { DLTensor dl_tensor; void *manager_ctx; void (*deleter)(void*); 
 enum { kDLCPU=1, kDLCUDA=2, kDLFloat=2, kDLUInt=1, CUVS_SUCCESS=0, NN_DESCENT=1, IVF_PQ=2, ITERATIVE_CAGRA_SEARCH=3,
  NO_FILTER=0, hipSuccess=0, hipHostAllocDefault=0, cudaSuccess=0, cudaHostAllocDefault=0, cudaMemcpyHostToDevice=1, cudaMemcpyDefault=4 };
 typedef void *cuvsResources_t;
-typedef struct Params { int build_algo, graph_degree, intermediate_graph_degree, nn_descent_niter; } *cuvsCagraIndexParams_t;
+typedef struct IvfBuild {uint32_t n_lists,pq_dim;} *cuvsIvfPqIndexParams_t;
+typedef struct IvfSearch {uint32_t n_probes;} *cuvsIvfPqSearchParams_t;
+struct cuvsIvfPqParams {cuvsIvfPqIndexParams_t ivf_pq_build_params; cuvsIvfPqSearchParams_t ivf_pq_search_params;float refinement_rate;};
+static int cuvsIvfPqIndexParamsCreate(cuvsIvfPqIndexParams_t*p) {*p=(cuvsIvfPqIndexParams_t)calloc(1,sizeof(**p));return *p?0:1;}
+static int cuvsIvfPqSearchParamsCreate(cuvsIvfPqSearchParams_t*p) {*p=(cuvsIvfPqSearchParams_t)calloc(1,sizeof(**p));return *p?0:1;}
+static int cuvsIvfPqIndexParamsDestroy(cuvsIvfPqIndexParams_t p) {free(p);return 0;}
+static int cuvsIvfPqSearchParamsDestroy(cuvsIvfPqSearchParams_t p) {free(p);return 0;}
+typedef struct Params { int build_algo, graph_degree, intermediate_graph_degree, nn_descent_niter; struct cuvsIvfPqParams* graph_build_params; } *cuvsCagraIndexParams_t;
 typedef struct Index { float *data; long rows, dim; } *cuvsCagraIndex_t;
 typedef struct SearchParams { size_t itopk_size; long search_width; } *cuvsCagraSearchParams_t;
 typedef struct { int type; uintptr_t addr; } cuvsFilter;
