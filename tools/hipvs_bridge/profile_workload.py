@@ -18,6 +18,7 @@ def vector_literal(row):
 
 
 def exact_topk(base, queries, k):
+    import numpy as np
     truth = []
     for query in queries:
         distances = np.empty(len(base), dtype=np.float64)
