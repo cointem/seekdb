@@ -18,6 +18,7 @@ def worker(args):
     queries=np.fromfile(args.queries,dtype='<f4').reshape(-1,args.dim)[:args.nq].copy()
     truth=np.load(args.truth)
     lib=C.CDLL(str(args.bridge.resolve()))
+    build_begin=time.perf_counter()
     pool_percent=int(os.environ.get('SK_CUVS_RMM_POOL_PERCENT','0'))
     if pool_percent:
         lib.cuvsRMMPoolMemoryResourceEnable.argtypes=[C.c_int,C.c_int,C.c_bool]
@@ -31,7 +32,7 @@ def worker(args):
     hip=C.CDLL('/opt/rocm/lib/libamdhip64.so');hip.hipDeviceSynchronize.restype=C.c_int
     def sync():
         if hip.hipDeviceSynchronize()!=0:raise RuntimeError('HIP synchronize failed')
-    start=time.perf_counter();handle=lib.seekdb_cuvs_build(base.ctypes.data,len(base),args.dim)
+    start=build_begin;handle=lib.seekdb_cuvs_build(base.ctypes.data,len(base),args.dim)
     if not handle:raise RuntimeError('GPU build failed')
     try:
         sync();build_ms=(time.perf_counter()-start)*1000
