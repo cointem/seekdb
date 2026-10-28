@@ -15,9 +15,10 @@
 #include <string.h>
 #include <time.h>
 
-/* Keep upstream graph degrees and search quality. 64 NN-Descent iterations
- * passed alternating 10k/128d and 100k/256d development checks; 32/16 did not
- * retain sufficient quality on the larger set. See profiling.md for limits. */
+/* Keep graph/search quality while reducing construction work. The default
+ * uses IVF-PQ candidates with FP32 refinement for adequately sized datasets;
+ * NN-Descent remains available for small/unsupported shapes and build retry.
+ * See profiling.md for measured scope and comparison limitations. */
 #define SK_GRAPH_DEG           128
 #define SK_INTERMEDIATE_DEG    256
 #define SK_NN_DESCENT_NITER    64
@@ -119,6 +120,11 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
 
   struct cuvsIvfPqParams pq_params = {0};
   const char *build_algo = getenv("SK_CUVS_BUILD_ALGO");
+  const int automatic = build_algo == NULL || build_algo[0] == '\0' || strcmp(build_algo, "auto") == 0;
+  /* At least 64 training rows per coarse partition; PQ subspaces have four
+   * FP32 coordinates. These are shape/resource choices, not dataset identity. */
+  const int auto_pq = automatic && n >= 8192 && dim >= 16 && dim % 4 == 0;
+  int build_status = CUVS_SUCCESS;
   const int64_t resource_start = sk_profile_begin();
   int64_t build_start = 0;
   double t0 = 0, t1 = 0;
@@ -126,8 +132,9 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   if (h == NULL) { return NULL; }
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) { goto fail_res; }
-  h->ip->build_algo = NN_DESCENT;
-  if (build_algo != NULL && build_algo[0] != '\0') {
+  h->ip->build_algo = auto_pq ? IVF_PQ : NN_DESCENT;
+  h->ip->graph_build_params = NULL;
+  if (!automatic) {
     if (strcmp(build_algo, "ivf_pq") == 0) {
       h->ip->build_algo = IVF_PQ;
     } else if (strcmp(build_algo, "iterative") == 0) {
@@ -137,17 +144,17 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
       goto fail_ip;
     }
   }
-  if (h->ip->build_algo == IVF_PQ && getenv("SK_CUVS_IVF_PROBES") != NULL) {
+  if (h->ip->build_algo == IVF_PQ) {
     if (cuvsIvfPqIndexParamsCreate(&pq_params.ivf_pq_build_params) != CUVS_SUCCESS ||
         cuvsIvfPqSearchParamsCreate(&pq_params.ivf_pq_search_params) != CUVS_SUCCESS) {
       goto fail_ip;
     }
     pq_params.ivf_pq_build_params->n_lists = (uint32_t)sk_env_long("SK_CUVS_IVF_LISTS", 128, 1, n);
-    pq_params.ivf_pq_build_params->pq_dim = (uint32_t)sk_env_long("SK_CUVS_PQ_DIM", dim / 2, 0, dim);
-    pq_params.ivf_pq_search_params->n_probes = (uint32_t)sk_env_long("SK_CUVS_IVF_PROBES", 32, 1,
+    pq_params.ivf_pq_build_params->pq_dim = (uint32_t)sk_env_long("SK_CUVS_PQ_DIM", dim / 4, 0, dim);
+    pq_params.ivf_pq_search_params->n_probes = (uint32_t)sk_env_long("SK_CUVS_IVF_PROBES", 64, 1,
         pq_params.ivf_pq_build_params->n_lists);
-    pq_params.ivf_pq_search_params->max_internal_batch_size = (uint32_t)sk_env_long("SK_CUVS_IVF_BATCH", 256, 1, 65536);
-    pq_params.refinement_rate = (float)sk_env_long("SK_CUVS_REFINE", 4, 1, 64);
+    pq_params.ivf_pq_search_params->max_internal_batch_size = (uint32_t)sk_env_long("SK_CUVS_IVF_BATCH", 128, 1, 65536);
+    pq_params.refinement_rate = (float)sk_env_long("SK_CUVS_REFINE", 2, 1, 64);
     h->ip->graph_build_params = &pq_params;
   }
   h->ip->graph_degree = gd;
@@ -158,7 +165,17 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   seekdb_vprofile_span("gpu.resources", h, resource_start, n, dim, 0, 0, 0);
   build_start = sk_profile_begin();
   t0 = sk_now_ms();
-  if (cuvsCagraBuild(h->res, h->ip, dset, h->idx) != CUVS_SUCCESS) {
+  build_status = cuvsCagraBuild(h->res, h->ip, dset, h->idx);
+  if (build_status != CUVS_SUCCESS && auto_pq) {
+    fprintf(stderr, "[seekdb_cuvs] IVF-PQ build failed, retrying GPU NN-Descent: %s\n", cuvsGetLastErrorText());
+    cuvsCagraIndexDestroy(h->idx);
+    h->idx = NULL;
+    h->ip->graph_build_params = NULL;
+    h->ip->build_algo = NN_DESCENT;
+    if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) { goto fail_ip; }
+    build_status = cuvsCagraBuild(h->res, h->ip, dset, h->idx);
+  }
+  if (build_status != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] CAGRA build error: %s\n", cuvsGetLastErrorText());
     seekdb_vprofile_span("gpu.cagra_build", h, build_start, n, dim, 0, 0, 1);
     goto fail_idx;
@@ -176,9 +193,9 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   h->n = n; h->dim = dim;
   if (sk_timing_on()) {
     fprintf(stderr,
-            "[seekdb_cuvs] build n=%ld dim=%ld gd=%ld igd=%ld niter=%ld device=%d "
+            "[seekdb_cuvs] build n=%ld dim=%ld gd=%ld igd=%ld niter=%ld algo=%d device=%d "
             "upload_ms=%.3f build_ms=%.3f\n",
-            n, dim, gd, igd, niter, dset->dl_tensor.device.device_type == kDLCUDA,
+            n, dim, gd, igd, niter, (int)h->ip->build_algo, dset->dl_tensor.device.device_type == kDLCUDA,
             own != NULL ? own->upload_ms : 0.0, t1 - t0);
   }
   if (own != NULL) {

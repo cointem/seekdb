@@ -51,7 +51,9 @@ static int cuvsCagraIndexParamsDestroy(cuvsCagraIndexParams_t p) {free(p);return
 static int cuvsCagraIndexCreate(cuvsCagraIndex_t *p) {*p=(cuvsCagraIndex_t)malloc(sizeof(**p));return 0;}
 static int cuvsCagraIndexDestroy(cuvsCagraIndex_t p) {free(p);return 0;}
 static int cuvsCagraBuild(cuvsResources_t r,cuvsCagraIndexParams_t p,DLManagedTensor *t,cuvsCagraIndex_t i) {
- (void)r;(void)p;i->data=(float*)t->dl_tensor.data;i->rows=t->dl_tensor.shape[0];i->dim=t->dl_tensor.shape[1];return 0; }
+ (void)r;const char *fault=getenv("PROFILE_FAULT");
+ if(fault&&strcmp(fault,"pq_build")==0&&p->build_algo==IVF_PQ)return 1;
+ i->data=(float*)t->dl_tensor.data;i->rows=t->dl_tensor.shape[0];i->dim=t->dl_tensor.shape[1];return 0; }
 static int cuvsCagraSerialize(cuvsResources_t r,const char*f,cuvsCagraIndex_t i,bool data) {(void)r;(void)f;(void)i;(void)data;return 0;}
 static int cuvsCagraDeserialize(cuvsResources_t r,const char*f,cuvsCagraIndex_t i) {(void)r;(void)f;(void)i;return 0;}
 static int cuvsCagraIndexGetSize(cuvsCagraIndex_t i,int64_t*n) {*n=i->rows;return 0;}
@@ -183,6 +185,12 @@ int main() {
  if(f&&strcmp(f,"empty_stage")==0) {
    void *s=seekdb_cuvs_stage_create(32,2);assert(s);
    assert(seekdb_cuvs_build_stage(s)==NULL);
+ } else if(f&&(strcmp(f,"pq_build")==0||strcmp(f,"pq_ok")==0)) {
+   float *large=(float*)calloc(8192*16,sizeof(float));assert(large);
+   void *h=seekdb_cuvs_build(large,8192,16);assert(h);
+   assert(((sk_cuvs_index*)h)->ip->build_algo==(strcmp(f,"pq_build")==0?NN_DESCENT:IVF_PQ));
+   float q[16]={0};assert(seekdb_cuvs_search(h,q,1,10,ids,dist)==0);
+   seekdb_cuvs_free(h);free(large);
  } else {
    void *h=seekdb_cuvs_build(base,32,2);assert(h);
    assert(seekdb_cuvs_search(h,query,1,10,ids,dist)==0);
@@ -194,7 +202,7 @@ int main() {
             src=root/'test.c';src.write_text(code)
             binary=root/'test'
             subprocess.run(['clang','-std=c11','-D__HIP_PLATFORM_AMD__','-fsanitize=address','-g','-I'+str(root),str(src),'-o',str(binary)],check=True,capture_output=True)
-            for enabled,fault in [('0',''),('1',''),('0','keep_alloc'),('0','stage_sync'),('1','empty_stage')]:
+            for enabled,fault in [('0',''),('1',''),('0','keep_alloc'),('0','stage_sync'),('1','empty_stage'),('0','pq_build'),('0','pq_ok')]:
                 env=dict(os.environ,SEEKDB_VECTOR_PROFILE=enabled,PROFILE_FAULT=fault,ASAN_OPTIONS='detect_leaks=0')
                 run=subprocess.run([str(binary)],capture_output=True,text=True,env=env)
                 self.assertEqual(run.returncode,0,run.stderr)

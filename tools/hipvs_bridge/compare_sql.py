@@ -23,6 +23,11 @@ def main():
         p.add_argument('--'+name+'-bridge',type=Path,required=True)
         p.add_argument('--'+name+'-commit',required=True)
         p.add_argument('--'+name+'-env',type=Path,help='JSON object of explicit SK_CUVS_ overrides')
+    p.add_argument('--base',type=Path,default=Path('/seekdb_workspace/datasets/base.f32'))
+    p.add_argument('--queries',type=Path,default=Path('/seekdb_workspace/datasets/query.f32'))
+    p.add_argument('--dim',type=int,default=128)
+    p.add_argument('--n',type=int,default=10000)
+    p.add_argument('--nq',type=int,default=100)
     p.add_argument('--baseline-kind',choices=['frozen','development'],default='frozen')
     p.add_argument('--baseline-niter',type=int)
     p.add_argument('--candidate-niter',type=int)
@@ -79,7 +84,8 @@ def main():
                     subprocess.run(mysql+['alter system set ob_vector_memory_limit_percentage=30'],check=True,capture_output=True,timeout=30)
                     workload=[sys.executable,str(Path(__file__).with_name('profile_workload.py')),
                         '--port',str(args.port),'--rounds','1','--label',name,'--commit',getattr(args,name+'_commit'),
-                        '--output',str(run_dir/'workload')]
+                        '--output',str(run_dir/'workload'),'--base',str(args.base),'--queries',str(args.queries),
+                        '--dim',str(args.dim),'--n',str(args.n),'--nq',str(args.nq)]
                     with (run_dir/'workload.log').open('w') as out:
                         run=subprocess.run(workload,env=env,stdout=out,stderr=subprocess.STDOUT,timeout=900)
                     result['status']='ok' if run.returncode==0 else 'failed'
