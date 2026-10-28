@@ -5,11 +5,28 @@ This workflow is for a **source-built observer and bridge**. Set
 required. Normal execution emits no profile records and adds no profile GPU
 synchronization when the switch is absent.
 
-The current working tree already contained experimental GPU parameter and
-staging changes before profiling was added. Profiling preserves those choices;
-this working tree must not be labelled as the untouched official baseline.
-Compare the frozen baseline and candidate with the same instrumentation,
-datasets and parameters.
+## Contest provenance
+
+The contest page checked on 2026-10-28 explicitly freezes
+`amd-cagra-contest-baseline-v1`, commit
+`08c76418a8e1fef3c1aae83010658ff56a4faa57`.
+Source: https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/seebnbaoxot1b0tb
+The newer upstream v5 (`634888d9b037153fa143d2c913ba4b25503e1d62`)
+is a descendant containing additional GPU correctness/persistence fixes; it is
+part of this candidate's history, **not the frozen performance comparator**.
+
+Verify the candidate before submission:
+
+```bash
+git merge-base --is-ancestor 08c76418a8e1fef3c1aae83010658ff56a4faa57 HEAD
+```
+
+This candidate also contains experimental GPU parameter and staging changes
+that predate profiling. Do not label it an untouched baseline. Use the exact
+frozen commit for performance comparisons. Diagnostic instrumentation adds
+synchronization; turn it off for performance results and use identical data,
+SQL parameters, and alternating cold runs. The convenience workload below
+uses fresh indexes within a warm process and is not the official evaluator.
 
 ## Build and run
 
