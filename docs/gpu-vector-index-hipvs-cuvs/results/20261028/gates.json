@@ -1,0 +1,145 @@
+{
+  "scope": "alternating fresh-process SQL comparison; not official score",
+  "baseline_kind": "development",
+  "status": "ok",
+  "official_score": null,
+  "absolute_recall_floor": null,
+  "rounds": [
+    {
+      "round": 0,
+      "baseline_build_ms": 32038.63724,
+      "candidate_build_ms": 12188.316732,
+      "candidate_gpu_algorithm_retries": 0,
+      "queries": {
+        "10": {
+          "baseline_recall": 0.9830000000000001,
+          "candidate_recall": 0.9880000000000001,
+          "recall_loss": -0.0050000000000000044,
+          "throughput_ratio": 0.998153899253786,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9654,
+          "candidate_recall": 0.9721000000000002,
+          "recall_loss": -0.00670000000000015,
+          "throughput_ratio": 1.0015773618990678,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      },
+      "batch": {
+        "10": {
+          "baseline_recall": 0.9890000000000002,
+          "candidate_recall": 0.986,
+          "recall_loss": 0.0030000000000002247,
+          "throughput_ratio": 2.9634698648504902,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9672000000000002,
+          "candidate_recall": 0.9719,
+          "recall_loss": -0.0046999999999998154,
+          "throughput_ratio": 2.801989208061781,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      }
+    },
+    {
+      "round": 1,
+      "baseline_build_ms": 30984.184953,
+      "candidate_build_ms": 11827.624937,
+      "candidate_gpu_algorithm_retries": 0,
+      "queries": {
+        "10": {
+          "baseline_recall": 0.9860000000000001,
+          "candidate_recall": 0.99,
+          "recall_loss": -0.0039999999999998925,
+          "throughput_ratio": 0.9903953590111941,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9676000000000002,
+          "candidate_recall": 0.9708,
+          "recall_loss": -0.0031999999999997586,
+          "throughput_ratio": 1.0071120876658042,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      },
+      "batch": {
+        "10": {
+          "baseline_recall": 0.9850000000000001,
+          "candidate_recall": 0.9860000000000002,
+          "recall_loss": -0.001000000000000112,
+          "throughput_ratio": 2.5274526349987427,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9667999999999999,
+          "candidate_recall": 0.9727,
+          "recall_loss": -0.005900000000000127,
+          "throughput_ratio": 2.8190696562689412,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      }
+    },
+    {
+      "round": 2,
+      "baseline_build_ms": 30712.129394,
+      "candidate_build_ms": 12223.888434,
+      "candidate_gpu_algorithm_retries": 0,
+      "queries": {
+        "10": {
+          "baseline_recall": 0.987,
+          "candidate_recall": 0.99,
+          "recall_loss": -0.0030000000000000027,
+          "throughput_ratio": 1.0295783034816055,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9643,
+          "candidate_recall": 0.9738000000000001,
+          "recall_loss": -0.009500000000000064,
+          "throughput_ratio": 1.0317606141191504,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      },
+      "batch": {
+        "10": {
+          "baseline_recall": 0.99,
+          "candidate_recall": 0.992,
+          "recall_loss": -0.0020000000000000018,
+          "throughput_ratio": 3.2176452796392785,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        },
+        "100": {
+          "baseline_recall": 0.9669,
+          "candidate_recall": 0.9695999999999999,
+          "recall_loss": -0.0026999999999999247,
+          "throughput_ratio": 3.3089244658035115,
+          "relative_recall_pass": true,
+          "throughput_pass": true
+        }
+      }
+    }
+  ],
+  "baseline_build_median_ms": 30984.184953,
+  "candidate_build_median_ms": 12188.316732,
+  "build_speedup": 2.5421217411959853,
+  "observed_relative_gates_pass": true,
+  "caveats": [
+    "Absolute Recall floors and official evaluator are not supplied by this tool.",
+    "Client query timings include CLI process/connection overhead.",
+    "SQL batch timings include a fresh graph build and result writes.",
+    "Development comparators do not establish a frozen-baseline contest score."
+  ]
+}

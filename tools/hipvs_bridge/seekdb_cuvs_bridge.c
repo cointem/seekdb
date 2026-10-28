@@ -173,6 +173,7 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   }
   build_status = cuvsCagraBuild(h->res, h->ip, dset, h->idx);
   if (build_status != CUVS_SUCCESS && auto_pq) {
+    seekdb_vprofile_span("route.gpu_build_retry", h, sk_profile_begin(), n, dim, 0, 0, build_status);
     fprintf(stderr, "[seekdb_cuvs] IVF-PQ build failed, retrying GPU NN-Descent: %s\n", cuvsGetLastErrorText());
     cuvsCagraIndexDestroy(h->idx);
     h->idx = NULL;

@@ -202,7 +202,7 @@ int main() {
             src=root/'test.c';src.write_text(code)
             binary=root/'test'
             subprocess.run(['clang','-std=c11','-D__HIP_PLATFORM_AMD__','-fsanitize=address','-g','-I'+str(root),str(src),'-o',str(binary)],check=True,capture_output=True)
-            for enabled,fault in [('0',''),('1',''),('0','keep_alloc'),('0','stage_sync'),('1','empty_stage'),('0','pq_build'),('0','pq_ok')]:
+            for enabled,fault in [('0',''),('1',''),('0','keep_alloc'),('0','stage_sync'),('1','empty_stage'),('0','pq_build'),('1','pq_build'),('0','pq_ok')]:
                 env=dict(os.environ,SEEKDB_VECTOR_PROFILE=enabled,PROFILE_FAULT=fault,ASAN_OPTIONS='detect_leaks=0')
                 run=subprocess.run([str(binary)],capture_output=True,text=True,env=env)
                 self.assertEqual(run.returncode,0,run.stderr)
@@ -211,6 +211,7 @@ int main() {
                     rows,invalid,_=summary.parse_records([path]);self.assertFalse(invalid)
                     stages={x['stage'] for x in rows}
                     self.assertTrue({'gpu.cagra_build','gpu.h2d_base','gpu.cagra_search','gpu.bridge_build_total','gpu.bridge_search_total'}<=stages)
+                elif enabled=='1' and fault=='pq_build': self.assertIn('route.gpu_build_retry',run.stderr)
                 elif enabled=='0': self.assertNotIn('[seekdb_profile]',run.stderr)
             # HIP builds may treat .c as C++; verify goto/declaration compatibility.
             subprocess.run(['clang++','-x','c++','-std=c++17','-D__HIP_PLATFORM_AMD__','-I'+str(root),'-fsyntax-only',str(src)],check=True,capture_output=True)
