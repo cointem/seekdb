@@ -41,8 +41,9 @@ int fts_byte_radix_sort(Row **rows, int64_t count, const KeyOf &key_of,
       std::sort(rows, rows + count, [&](const Row *left, const Row *right) {
         const auto &a = key_of(left);
         const auto &b = key_of(right);
-        const auto length = std::min(a.len_, b.len_);
-        const int cmp = length == 0 ? 0 : std::memcmp(a.ptr_, b.ptr_, length);
+        // Ancestor buckets have already proved these bytes equal.
+        const auto length = std::min(a.len_, b.len_) - prefix;
+        const int cmp = length == 0 ? 0 : std::memcmp(a.ptr_ + prefix, b.ptr_ + prefix, length);
         return cmp == 0 ? a.len_ < b.len_ : cmp < 0;
       });
       break;
@@ -71,6 +72,20 @@ int fts_byte_radix_sort(Row **rows, int64_t count, const KeyOf &key_of,
     if (live == 1) {
       if (only == 0) { break; }
       ++prefix;
+      // Inspect each key once to find the rest of the common prefix, instead
+      // of rebuilding a histogram for every identical byte. Stop at the
+      // existing prefix bound so very long keys retain bounded radix work.
+      const auto &first = key_of(rows[0]);
+      int64_t common = std::min<int64_t>(first.len_, 256);
+      for (int64_t i = 1; ret == 0 && i < count && common > prefix; ++i) {
+        if ((i & 8191) == 0 && (ret = check_status()) != 0) { break; }
+        const auto &key = key_of(rows[i]);
+        common = std::min<int64_t>(common, key.len_);
+        int64_t matched = prefix;
+        while (matched < common && first.ptr_[matched] == key.ptr_[matched]) { ++matched; }
+        common = matched;
+      }
+      prefix = common;
       continue;
     }
     int64_t moves = 0;

@@ -26,6 +26,12 @@ static void check(int size, int mode, unsigned seed, int cancel_after = -1)
     else if (mode == 3) { text = std::string(300, '\0') + std::to_string(rng() % 1000); }
     else if (mode == 4) { text = std::string(80, static_cast<char>(255)); }
     else if (mode == 7) { text = std::string(i % 40, 'a') + 'b' + std::to_string(i); }
+    else if (mode == 8) { text = std::string(255 + i % 3, '\xff') + std::to_string(rng() % 100); }
+    else if (mode == 9) { text = std::string(100, '\0'); if (i % 5) { text += std::to_string(rng()); } }
+    else if (mode == 10) {
+      text = std::string(32, '\xff') + static_cast<char>(i % 4)
+          + std::string(100, '\0') + std::to_string(rng());
+    }
     else {
       text.resize(rng() % 96);
       for (char &c : text) { c = static_cast<char>(rng() % 256); }
@@ -59,9 +65,12 @@ int main()
 {
   int cases = 0;
   for (int size : {0, 1, 2, 63, 64, 65, 4095, 4096, 4097, 16384}) {
-    for (int mode = 0; mode < 8; ++mode) { check(size, mode, size * 131 + mode); ++cases; }
+    for (int mode = 0; mode < 11; ++mode) { check(size, mode, size * 131 + mode); ++cases; }
   }
   for (unsigned seed = 0; seed < 200; ++seed) { check(64 + seed * 19, 0, seed); ++cases; }
   for (int limit = 1; limit <= 12; ++limit) { check(16384, 0, 73, limit); ++cases; }
+  for (int mode : {3, 9, 10}) {
+    for (int limit = 1; limit <= 4; ++limit) { check(16384, mode, 73, limit); ++cases; }
+  }
   std::printf("PASS %d radix differential/permutation/cancellation cases\n", cases);
 }
