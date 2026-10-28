@@ -165,6 +165,12 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   seekdb_vprofile_span("gpu.resources", h, resource_start, n, dim, 0, 0, 0);
   build_start = sk_profile_begin();
   t0 = sk_now_ms();
+  if (sk_timing_on() && h->ip->graph_build_params != NULL) {
+    fprintf(stderr, "[seekdb_cuvs] IVF-PQ config gd=%ld igd=%ld lists=%u pq_dim=%u probes=%u batch=%u refine=%g\n",
+            gd, igd, pq_params.ivf_pq_build_params->n_lists,
+            pq_params.ivf_pq_build_params->pq_dim, pq_params.ivf_pq_search_params->n_probes,
+            pq_params.ivf_pq_search_params->max_internal_batch_size, (double)pq_params.refinement_rate);
+  }
   build_status = cuvsCagraBuild(h->res, h->ip, dset, h->idx);
   if (build_status != CUVS_SUCCESS && auto_pq) {
     fprintf(stderr, "[seekdb_cuvs] IVF-PQ build failed, retrying GPU NN-Descent: %s\n", cuvsGetLastErrorText());
