@@ -99,7 +99,8 @@ def main():
                     "a" * 83 + " " + "a" * 84 + " " + "a" * 85,
                     "数据库 alpha à é " * 400]
             docs += words[4:]
-            docs *= 3
+            # Cross the FTS radix eligibility threshold in every DDL collation case.
+            docs *= 64
             options = "WITH PARSER space PARSER_PROPERTIES=(min_token_size=1,max_token_size=84)"
             for kind, table in zip(kinds, tables):
                 sql(f"CREATE TABLE {table}(id INT PRIMARY KEY, body LONGTEXT COLLATE {collation});")

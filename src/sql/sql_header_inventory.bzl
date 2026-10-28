@@ -1012,6 +1012,7 @@ SQL_PRIVATE_HEADERS = [
     "engine/set/ob_merge_set_op.h",
     "engine/set/ob_merge_union_op.h",
     "engine/set/ob_set_op.h",
+    "engine/sort/fts_byte_radix_sort.h",
     "engine/sort/ob_sort_op.h",
     "engine/subquery/ob_subplan_filter_op.h",
     "engine/subquery/ob_subplan_scan_op.h",

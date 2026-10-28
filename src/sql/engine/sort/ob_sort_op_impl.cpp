@@ -18,6 +18,7 @@
 
 #include "config_bridge.h"
 #include "ob_sort_op_impl.h"
+#include "sql/engine/sort/fts_byte_radix_sort.h"
 #include "query/engine/basic/ob_encoded_sort_row.h"
 #include "data_plane/encoding/ob_cpu_features.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
@@ -1855,15 +1856,27 @@ int ObSortOpImpl::sort_inmem_data()
       } else if (part_cnt_ > 0) {
         OZ(do_partition_sort(*rows_, begin, rows_->count()));
       } else if (enable_encode_sortkey_) {
-        bool can_encode = true;
-        ObAdaptiveQS aqs(*rows_, mem_context_->get_malloc_allocator());
-        if (OB_FAIL(aqs.init(*rows_, mem_context_->get_malloc_allocator(), begin, rows_->count(), can_encode))) {
-        } else if (can_encode) {
-          aqs.sort(begin, rows_->count());
+        bool fts_radix = fts_stable_output_batch_ && rows_ == &quick_sort_array_
+            && !need_imms() && rows_->count() >= 4096;
+        for (int64_t i = 0; fts_radix && i < rows_->count(); ++i) {
+          fts_radix = nullptr != rows_->at(i) && !rows_->at(i)->cells()[0].is_null();
+        }
+        if (fts_radix) {
+          ret = fts_byte_radix_sort(&rows_->at(0), rows_->count(),
+              [](const ObChunkDatumStore::StoredRow *row) -> const ObDatum & { return row->cells()[0]; },
+              [&]() { return exec_ctx_->check_status(); });
+          LOG_INFO("fts in-place encoded radix sort", K(ret), "rows", rows_->count());
         } else {
-          enable_encode_sortkey_ = false;
-          comp_.enable_encode_sortkey_ = false;
-          lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+          bool can_encode = true;
+          ObAdaptiveQS aqs(*rows_, mem_context_->get_malloc_allocator());
+          if (OB_FAIL(aqs.init(*rows_, mem_context_->get_malloc_allocator(), begin, rows_->count(), can_encode))) {
+          } else if (can_encode) {
+            aqs.sort(begin, rows_->count());
+          } else {
+            enable_encode_sortkey_ = false;
+            comp_.enable_encode_sortkey_ = false;
+            lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+          }
         }
       } else {
         lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
