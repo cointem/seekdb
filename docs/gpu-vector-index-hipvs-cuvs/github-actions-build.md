@@ -55,9 +55,11 @@ the matching SDK archive. The workflow verifies the pinned SHA-256
 `aad96f94c7cafaa6ac9afcd409164bc029f0890f8b295ab26b30b784cfb79074`.
 The SDK snapshot is available locally at
 `validation/github-actions/amd-build-sdk.tar.gz` in the oceanbase workspace.
-No SDK upload has been performed: public redistribution requires confirmation
-that the contest SDK may be redistributed. A private download URL can be used
-instead. Keep any signed or authenticated URL in the secret, not in source.
+The owner-authorized SDK is published at
+https://github.com/cointem/seekdb/releases/tag/amd-build-sdk-rocm-7.2.4
+and `AMD_BUILD_SDK_URL` has been configured for that asset. A private download
+URL can also be used. Keep any signed or authenticated URL in the secret, not
+in source.
 Without this secret the build fails early with a missing-SDK message.
 
 The fixed SDK archive contains only the contest image's `/opt/hipvs`
