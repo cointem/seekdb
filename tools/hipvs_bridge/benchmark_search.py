@@ -21,7 +21,7 @@ def main():
     p.add_argument('--n',type=int,required=True)
     p.add_argument('--nq',type=int,default=100)
     p.add_argument('--widths',type=int,nargs='+',default=[1,2,4,8])
-    p.add_argument('--itopks',type=int,nargs='+',default=[512,640])
+    p.add_argument('--itopks',type=int,nargs='+',default=[512,1024])
     p.add_argument('--rounds',type=int,default=3)
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args()
