@@ -158,6 +158,7 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   build_start = sk_profile_begin();
   t0 = sk_now_ms();
   if (cuvsCagraBuild(h->res, h->ip, dset, h->idx) != CUVS_SUCCESS) {
+    fprintf(stderr, "[seekdb_cuvs] CAGRA build error: %s\n", cuvsGetLastErrorText());
     seekdb_vprofile_span("gpu.cagra_build", h, build_start, n, dim, 0, 0, 1);
     goto fail_idx;
   }
@@ -392,7 +393,7 @@ int seekdb_cuvs_search(void *handle, const float *query, long nq, long topk,
     sp->search_width = width;
     cuvsFilter f; f.type = NO_FILTER; f.addr = (uintptr_t)0;
     phase_start = sk_profile_begin();
-    if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc = 15; goto done; }
+    if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { fprintf(stderr, "[seekdb_cuvs] CAGRA search error: %s\n", cuvsGetLastErrorText()); rc = 15; goto done; }
     if (sk_profile_sync() != 0) { rc = 18; goto done; }
     seekdb_vprofile_span("gpu.cagra_search", h, phase_start, h->n, h->dim, nq, topk, 0);
     phase_start = sk_profile_begin();
