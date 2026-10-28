@@ -23,7 +23,7 @@ def worker(args):
     if pool_percent:
         lib.cuvsRMMPoolMemoryResourceEnable.argtypes=[C.c_int,C.c_int,C.c_bool]
         lib.cuvsRMMPoolMemoryResourceEnable.restype=C.c_int
-        if lib.cuvsRMMPoolMemoryResourceEnable(1,pool_percent,False)!=0:
+        if lib.cuvsRMMPoolMemoryResourceEnable(1,pool_percent,False)!=1:
             raise RuntimeError('RMM pool initialization failed')
     ptr=C.c_void_p
     lib.seekdb_cuvs_build.argtypes=[ptr,C.c_long,C.c_long];lib.seekdb_cuvs_build.restype=ptr
