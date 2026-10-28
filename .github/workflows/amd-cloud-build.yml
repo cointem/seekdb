@@ -1,0 +1,81 @@
+name: AMD cloud development build
+
+on:
+  push:
+    branches: [codex/amd-build-actions]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or full commit to build from this repository
+        default: codex/amd-cagra-v5-profile
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amd-cloud-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      SDK_URL: ${{ secrets.AMD_BUILD_SDK_URL }}
+      SDK_SHA256: aad96f94c7cafaa6ac9afcd409164bc029f0890f8b295ab26b30b784cfb79074
+      JOBS: '2'
+    steps:
+      - name: Check SDK download configuration
+        run: |
+          if [[ -z "$SDK_URL" ]]; then
+            echo '::error::Configure the AMD_BUILD_SDK_URL Actions secret for the approved SDK download URL.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || 'codex/amd-cagra-v5-profile' }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential rpm2cpio cpio m4 libtool-bin python3 patchelf zstd
+      - name: Setup pinned Rust toolchain
+        working-directory: source/rust
+        run: |
+          cargo --version
+          rustc --version
+      - name: Cache dependency packages and extracted toolchain
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: source/deps/3rd
+          key: amd-dev-ubuntu24-x86_64-v1-${{ hashFiles('source/deps/init/oceanbase.el9.x86_64.deps', 'ci/.github/scripts/amd-build/build.sh') }}
+      - name: Build and package
+        working-directory: source
+        env:
+          DEPS_CACHE_HIT: ${{ steps.deps.outputs.cache-hit }}
+        run: bash ../ci/.github/scripts/amd-build/build.sh
+      - name: Upload build logs, including failed builds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-build-logs-${{ github.run_id }}
+          path: source/ci-logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload development binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-linux-x86_64-${{ github.run_id }}
+          path: source/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
