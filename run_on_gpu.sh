@@ -4,11 +4,14 @@ set -Eeuo pipefail
 if [[ "${1:-}" == "--help" ]]; then
   echo 'Usage: bash run_on_gpu.sh'
   echo 'Optional environment: JOBS=8 PORT=2981 N=10000 DIM=128 NQ=100 ROUNDS=3 LABEL=candidate-001'
+  echo 'INIT_DEPS=0 reuses already initialized dependencies (default: 1)'
   echo 'Optional: BASE_FILE=/path/base.f32 QUERY_FILE=/path/query.f32 RUN_ROOT=/workspace/amd-profile-runs'
   exit 0
 fi
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR=$PWD
+INIT_DEPS=${INIT_DEPS:-1}
+[[ "$INIT_DEPS" == 0 || "$INIT_DEPS" == 1 ]] || { echo 'INIT_DEPS must be 0 or 1'; exit 2; }
 JOBS=${JOBS:-8}
 PORT=${PORT:-2981}
 N=${N:-10000}
@@ -82,7 +85,9 @@ echo '[1/5] Build the GPU bridge'
 mkdir -p "$RUN/bridge"
 bash tools/hipvs_bridge/build.sh "$RUN/bridge/libseekdb_cuvs_bridge.so" 2>&1 | tee "$RUN/bridge-build.log"
 echo '[2/5] Initialize dependencies and compile seekdb (first run can take considerable time)'
-bash build.sh release --init -DOB_BUILD_CUVS=ON -DOB_BUILD_CUVS_TRACE=OFF \
+init_args=()
+[[ "$INIT_DEPS" == 0 ]] || init_args+=(--init)
+bash build.sh release "${init_args[@]}" -DOB_BUILD_CUVS=ON -DOB_BUILD_CUVS_TRACE=OFF \
   "-DCUVS_BRIDGE_LIB=$RUN/bridge/libseekdb_cuvs_bridge.so" --make "-j$JOBS" 2>&1 | tee "$RUN/build.log"
 OBSERVER="$SOURCE_DIR/build_release/src/observer/seekdb"
 [[ -x "$OBSERVER" ]] || { echo "Source-built binary not found: $OBSERVER"; exit 2; }
