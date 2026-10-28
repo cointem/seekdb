@@ -189,3 +189,58 @@ Tests compile the timing header, exercise opt-in/multithreaded counters, check
 collector deduplication, and exercise bridge ownership/error paths using fake
 GPU APIs with AddressSanitizer. They do not validate real GPU speed/Recall or
 replace a complete Linux/ROCm observer build.
+
+
+## Optimized construction and reproducible comparisons
+
+The default bridge now constructs CAGRA from IVF-PQ candidates followed by
+FP32 refinement when `n >= 8192`, `dim >= 16`, and `dim` is divisible by four.
+It uses 128 coarse partitions, 64 probes, PQ subspaces of four coordinates,
+refinement rate 2, and internal query batches of 128. The stored dataset and
+query distance computation remain FP32. Graph degree 128, intermediate degree
+256, and search candidate floor 512 are unchanged. This is approximate graph
+construction and must still pass Recall checks on the evaluation data.
+
+Smaller or unsupported shapes use NN-Descent (64 iterations). If the automatic
+IVF-PQ build fails, the bridge destroys the incomplete index and retries
+NN-Descent on the GPU. Both attempts remain inside the build timer; no previous
+index is reused. Explicit algorithm overrides fail visibly instead of retrying,
+so failed development configurations cannot masquerade as successful tests.
+
+`SK_CUVS_BUILD_ALGO=nn_descent` and `SK_CUVS_NN_NITER=100` select the upstream-v5
+algorithmic development comparator. This is **not** the frozen-v1 comparator.
+`SK_CUVS_BUILD_ALGO=auto` selects the submission default. Other development knobs
+are `SK_CUVS_IVF_LISTS`, `SK_CUVS_IVF_PROBES`, `SK_CUVS_PQ_DIM`,
+`SK_CUVS_REFINE`, and `SK_CUVS_IVF_BATCH`. Do not set them in a submission runner
+unless the chosen configuration is intentionally part of that submission.
+
+For an alternating isolated-process development sweep:
+
+```bash
+LD_LIBRARY_PATH=/opt/hipvs/lib:/opt/rocm/lib python3 tools/hipvs_bridge/benchmark_bridge.py \
+  --bridge /absolute/path/libseekdb_cuvs_bridge.so \
+  --base /absolute/path/base.f32 --queries /absolute/path/query.f32 \
+  --n 100000 --dim 256 --rounds 3 \
+  --variants tools/hipvs_bridge/experiments/pq-development-256d.json \
+  --output /workspace/bridge-comparison-new
+```
+
+That checked-in variant file is specifically a **256-dimensional development
+experiment**, not an adaptive production configuration. Without `--variants`,
+the benchmark sweeps NN-Descent iterations; an explicit external
+`SK_CUVS_BUILD_ALGO` can select another algorithm. Every result records the
+library hash, input hashes, overrides and exact float64 ground-truth Recall.
+
+`compare_sql.py` restarts a source-built database for every run, alternates the
+order, creates fresh storage directories and includes CREATE INDEX plus the
+first legal query. Use `--baseline-kind frozen` only with the exact frozen
+source. For algorithm development, set `--baseline-kind development`, pass
+`--baseline-env` a JSON object containing
+`{"SK_CUVS_BUILD_ALGO":"nn_descent"}`, and set `--baseline-niter 100`.
+Leave candidate overrides absent to exercise the production default. Explicit
+`--base`, `--queries`, `--n`, `--dim` and `--nq` permit larger SQL comparisons.
+Its reports include binary/library hashes and the effective configuration.
+
+The standalone `experimental_fp16.cpp` is a rejected development experiment:
+FP16 graph generation with FP32 search did not materially improve construction
+on the tested GPU. It is not linked by `build.sh` or used by the submission.

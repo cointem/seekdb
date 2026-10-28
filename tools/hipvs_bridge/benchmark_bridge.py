@@ -86,7 +86,8 @@ def main():
         'parameter_overrides':{k:v for k,v in os.environ.items() if k.startswith('SK_CUVS_')}}
     report_path=args.output/'results.json'
     variants=json.loads(args.variants.read_text()) if args.variants else [
-        {'name':'iter-'+str(i),'environment':{'SK_CUVS_NN_NITER':str(i)}} for i in args.iterations]
+        {'name':'iter-'+str(i),'environment':{'SK_CUVS_NN_NITER':str(i),
+         'SK_CUVS_BUILD_ALGO':os.environ.get('SK_CUVS_BUILD_ALGO','nn_descent')}} for i in args.iterations]
     if not variants or len({v['name'] for v in variants})!=len(variants):p.error('empty or duplicate variants')
     for v in variants:
         if not all(c.isalnum() or c in '-_' for c in v['name']):p.error('invalid variant name')
