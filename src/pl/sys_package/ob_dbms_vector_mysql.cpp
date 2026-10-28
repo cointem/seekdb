@@ -20,9 +20,11 @@
 #include "src/pl/ob_pl.h"
 #include "sql/engine/cmd/ob_vector_refresh_index_executor.h"
 #include "lib/vector/ob_vsag_adaptor.h"
+#include "lib/vector/seekdb_vector_profile.h"
 #include "share/ob_lob_access_utils.h"
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 namespace oceanbase
 {
@@ -520,9 +522,11 @@ int ObDBMSVectorMySql::print_mem_size(uint64_t mem_size, ObStringBuffer &res_buf
 static int batch_knn_read_vectors(const common::ObString &db,
                                   const common::ObString &tbl,
                                   std::vector<float> &vecs,
-                                  std::vector<int64_t> &ids, int &dim)
+                                  std::vector<int64_t> &ids, int &dim, const char *profile_stage)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile(profile_stage, &vecs, ret);
+  VectorProfileCounter decode(strcmp(profile_stage, "sql.scan_base") == 0 ? "sql.decode_base" : "sql.decode_probes", &vecs);
   common::ObArenaAllocator tmp_alloc;
   SMART_VAR(ObMySQLProxy::MySQLResult, res) {
     common::ObSqlString sql;
@@ -537,6 +541,7 @@ static int batch_knn_read_vectors(const common::ObString &db,
       ret = OB_ERR_UNEXPECTED;
     } else {
       while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        const int64_t decode_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
         ObObj id_obj;
         ObObj vec_obj;
         if (OB_FAIL(result->get_obj(static_cast<int64_t>(0), id_obj))) {
@@ -587,10 +592,12 @@ static int batch_knn_read_vectors(const common::ObString &db,
             }
           }
         }
+        decode.add(decode_start, 1, ret);
       }
       if (OB_ITER_END == ret) { ret = OB_SUCCESS; }
     }
   }
+  profile.rows(ids.size());
   return ret;
 }
 
@@ -598,6 +605,7 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
 {
   UNUSED(result);
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("sql.batch_total", &ctx, ret);
   CK(OB_LIKELY(4 == params.count()));
   if (OB_SUCC(ret)
       && (!params.at(0).is_varchar() || !params.at(1).is_varchar()
@@ -625,8 +633,8 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
       if (db.empty()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("batch_knn: no database selected", K(ret));
-      } else if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim))) {
-      } else if (OB_FAIL(batch_knn_read_vectors(db, probe_table, query, probe_ids, qdim))) {
+      } else if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim, "sql.scan_base"))) {
+      } else if (OB_FAIL(batch_knn_read_vectors(db, probe_table, query, probe_ids, qdim, "sql.scan_probes"))) {
       } else if (base_ids.empty() || probe_ids.empty() || bdim == 0 || bdim != qdim) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("batch_knn: empty or dim mismatch", K(ret), K(base_ids.size()), K(probe_ids.size()), K(bdim), K(qdim));
@@ -636,12 +644,15 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
         const long nq = static_cast<long>(probe_ids.size());
         std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
         std::vector<float> dist(static_cast<size_t>(nq) * topk);
+        const int64_t gpu_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
         const long served = common::obvsag::cuvs_batch_knn(base.data(), n, bdim,
                                 query.data(), nq, topk, off.data(), dist.data());
+        seekdb_vprofile_span("sql.gpu_batch", &ctx, gpu_start, n, bdim, nq, topk, served == nq ? 0 : 1);
         if (served != nq) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("batch_knn: GPU backend did not serve", K(ret), K(served), K(nq));
         } else {
+          VectorProfileScope output_profile("sql.write_results", &ctx, ret, nq * topk, bdim, nq, topk);
           int64_t affected = 0;
           common::ObSqlString del;
           if (OB_FAIL(del.assign_fmt("DELETE FROM `%.*s`.`%.*s`",

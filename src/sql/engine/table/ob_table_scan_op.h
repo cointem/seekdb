@@ -19,6 +19,7 @@
 
 #include "data_plane/access/ob_tablet_scan.h"
 #include "sql/engine/ob_operator.h"
+#include "lib/vector/seekdb_vector_profile.h"
 #include "sql/engine/ob_operator_reg.h"
 #include "sql/optimizer/ob_join_order.h"
 #include "sql/engine/expr/ob_sql_expression.h"
@@ -757,6 +758,8 @@ protected:
   bool need_check_outrow_lob_;
 private:
   ObRandScanProcessor rand_scan_processor_;
+  VectorProfileCounter profile_scan_rows_{"sql.table_scan_rows", this};
+  VectorProfileCounter profile_scan_batches_{"sql.table_scan_batches", this};
  };
 
 } // end namespace sql

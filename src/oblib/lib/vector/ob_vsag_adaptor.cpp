@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include "seekdb_vector_profile.h"
 #include <map>
 #include <set>
 #include <mutex>
@@ -85,6 +86,7 @@ struct ObCuvsEntry {
   std::vector<int64_t> ids_;    // CAGRA row offset -> external vid (of the built index)
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
+  VectorProfileCounter profile_buffer_{"adaptor.buffer_vectors", this};
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
 };
@@ -176,9 +178,11 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
   if (slot->dim_ != dim) { return; }
+  const int64_t profile_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
+  slot->profile_buffer_.add(profile_start, size, 0);
 }
 static bool ob_cuvs_vsag_ready(void *key) {
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
@@ -270,10 +274,13 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *&dist, const int64_t *&ids,
                                int64_t &result_size, void *filter, bool reverse_filter) {
   if (topk <= 0) { return false; }
+  const int64_t lock_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  seekdb_vprofile_span("adaptor.registry_lock_wait", key, lock_start, 0, 0, 1, topk, 0);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return false; }
   ObCuvsEntry *ent = it->second;
+  ent->profile_buffer_.flush();
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
   // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
@@ -626,6 +633,7 @@ public:
     index_ = nullptr;
     LOG_INFO("[OBVSAG] after deconstruction, hnsw index", KP(allocator_), K(index_.use_count()), K(lbt()));
   }
+  void flush_profile() const { profile_cpu_add_.flush(); }
   int build_index(const vsag::DatasetPtr &base);
   int ensure_vsag_fallback();
   int get_index_number();
@@ -693,6 +701,7 @@ private:
   int16_t refine_type_;
   int16_t bq_bits_query_;
   bool bq_use_fht_;
+  VectorProfileCounter profile_cpu_add_{"cpu.vsag_add", this};
   bool use_reorder_;
   float doc_prune_ratio_;
   int window_size_;
@@ -701,6 +710,7 @@ private:
 int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("cpu.vsag_build", this, ret, base->GetNumElements(), dim_);
   try {
     tl::expected<std::vector<int64_t>, Error> result = index_->Build(base);
     if (result.has_value()) {
@@ -732,12 +742,14 @@ int HnswIndexHandler::get_index_number()
 int HnswIndexHandler::add_index(const vsag::DatasetPtr &incremental)
 {
   int ret = OB_SUCCESS;
+  const int64_t profile_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   tl::expected<std::vector<int64_t>, Error> result = index_->Add(incremental);
   if (result.has_value()) {
     LOG_DEBUG("add index success", K(get_index_number()));
   } else {
     ret = vsag_errcode2ob(result.error().type);
   }
+  profile_cpu_add_.add(profile_start, incremental->GetNumElements(), ret);
   return ret;
 }
 
@@ -925,6 +937,8 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  float distance_threshold)
 {
   int ret = OB_SUCCESS;
+  flush_profile();
+  VectorProfileScope profile("cpu.vsag_search", this, ret, 0, dim_, 1, topk);
   std::function<bool(int64_t)> vid_filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
       return bitmap->test(id);
@@ -977,6 +991,8 @@ int HnswIndexHandler::knn_search(const vsag::DatasetPtr &query, int64_t topk,
                                  bool is_last_search, void *allocator)
 {
   int ret = OB_SUCCESS;
+  flush_profile();
+  VectorProfileScope profile("cpu.vsag_search", this, ret, 0, dim_, 1, topk);
   std::function<bool(int64_t)> filter = [bitmap, reverse_filter](int64_t id) -> bool {
     if (!reverse_filter) {
       return bitmap->test(id);
@@ -1748,22 +1764,28 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
                float distance_threshold)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("adaptor.knn_total", index_handler, ret, 0, dim, 1, topk);
   ob_vsag_trace("knn_simple", (const void*)index_handler, (long)(dim), (long)(topk));
   if (index_handler == nullptr || query_vector == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(query_vector));
   } else {
+    static_cast<HnswIndexHandler *>(index_handler)->flush_profile();
     if (ob_cuvs_marked(index_handler)) {
       HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
           ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
                              query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
+        seekdb_vprofile_span("route.gpu_served", index_handler,
+            seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0, result_size, dim, 1, topk, 0);
         return OB_SUCCESS;
       }
       if (OB_FAIL(cuvs_hnsw->ensure_vsag_fallback())) {
         return ret;
       }
     }
+    seekdb_vprofile_span(ob_cuvs_marked(index_handler) ? "route.cpu_fallback" : "route.cpu_selected",
+        index_handler, seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0, 0, dim, 1, topk, 0);
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1800,22 +1822,28 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
                bool is_last_search, void *allocator)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("adaptor.knn_total", index_handler, ret, 0, dim, 1, topk);
   ob_vsag_trace("knn_iterctx", (const void*)index_handler, (long)(dim), (long)(topk));
   if (index_handler == nullptr || query_vector == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler), K(query_vector));
   } else {
+    static_cast<HnswIndexHandler *>(index_handler)->flush_profile();
     if (ob_cuvs_marked(index_handler)) {
       HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
           ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
                              query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
+        seekdb_vprofile_span("route.gpu_served", index_handler,
+            seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0, result_size, dim, 1, topk, 0);
         return OB_SUCCESS;
       }
       if (OB_FAIL(cuvs_hnsw->ensure_vsag_fallback())) {
         return ret;
       }
     }
+    seekdb_vprofile_span(ob_cuvs_marked(index_handler) ? "route.cpu_fallback" : "route.cpu_selected",
+        index_handler, seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0, 0, dim, 1, topk, 0);
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -2079,6 +2107,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return 0; }
   ObCuvsEntry *ent = it->second;
+  ent->profile_buffer_.flush();
   const size_t n = ent->buf_ids_.size();
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
@@ -2115,12 +2144,14 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   if (!ob_cuvs_enabled()) { return 0; }
   if (base == nullptr || query == nullptr || out_ids == nullptr ||
       out_dist == nullptr || n <= 0 || dim <= 0 || nq <= 0 || topk <= 0) { return 0; }
+  const int64_t profile_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0};
   pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
   if (pthread_create(&tid, &attr, ob_cuvs_raw_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
   ob_vsag_trace("cuvs_raw_batch", base, nq, topk);
+  seekdb_vprofile_span("adaptor.raw_batch_total", base, profile_start, n, dim, nq, topk, job.served_ == nq ? 0 : 1);
   return job.served_;
 }
 
