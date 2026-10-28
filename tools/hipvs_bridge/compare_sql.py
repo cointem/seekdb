@@ -22,6 +22,7 @@ def main():
         p.add_argument('--'+name+'-bin',type=Path,required=True)
         p.add_argument('--'+name+'-bridge',type=Path,required=True)
         p.add_argument('--'+name+'-commit',required=True)
+        p.add_argument('--'+name+'-env',type=Path,help='JSON object of explicit SK_CUVS_ overrides')
     p.add_argument('--baseline-kind',choices=['frozen','development'],default='frozen')
     p.add_argument('--baseline-niter',type=int)
     p.add_argument('--candidate-niter',type=int)
@@ -36,13 +37,18 @@ def main():
             'profiling':False,'port':args.port,'binaries':{},'baseline_kind':args.baseline_kind,
             'iteration_overrides':{'baseline':args.baseline_niter,'candidate':args.candidate_niter}}
     for name in ('baseline','candidate'):
+        env_path=getattr(args,name+'_env')
+        overrides=json.loads(env_path.read_text()) if env_path else {}
+        if not isinstance(overrides,dict) or any(not k.startswith('SK_CUVS_') for k in overrides):
+            p.error('only SK_CUVS_ environment overrides allowed')
+        setattr(args,name+'_overrides',{k:str(v) for k,v in overrides.items()})
         binary=getattr(args,name+'_bin').resolve();bridge=getattr(args,name+'_bridge').resolve()
         def digest(path):
             h=hashlib.sha256()
             with path.open('rb') as f:
                 for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
             return h.hexdigest()
-        report['binaries'][name]={'commit':getattr(args,name+'_commit'),'binary_sha256':digest(binary),'bridge_sha256':digest(bridge)}
+        report['binaries'][name]={'commit':getattr(args,name+'_commit'),'binary_sha256':digest(binary),'bridge_sha256':digest(bridge),'environment_overrides':getattr(args,name+'_overrides')}
     def save():(args.output/'comparison.json').write_text(json.dumps(report,indent=2))
     mysql=['mysql','--connect-timeout=2','-h127.0.0.1','-P'+str(args.port),'-uroot','-e']
     for round_no in range(args.rounds):
@@ -51,6 +57,7 @@ def main():
             run_dir=args.output/f'{round_no}-{name}';run_dir.mkdir()
             base=run_dir/'base';store=run_dir/'store';base.mkdir();store.mkdir()
             env={k:v for k,v in os.environ.items() if not k.startswith(('SEEKDB_VECTOR_PROFILE','SK_CUVS_'))}
+            env.update(getattr(args,name+'_overrides'))
             niter=getattr(args,name+'_niter')
             if niter is not None:env['SK_CUVS_NN_NITER']=str(niter)
             bridge=getattr(args,name+'_bridge').resolve()
