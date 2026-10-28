@@ -15,12 +15,12 @@
 #include <string.h>
 #include <time.h>
 
-/* Preserve upstream v5 graph quality by default. Parameter sweeps may override
- * these values, but faster settings must pass larger-data Recall checks before
- * becoming defaults. */
+/* Keep upstream graph degrees and search quality. 64 NN-Descent iterations
+ * passed alternating 10k/128d and 100k/256d development checks; 32/16 did not
+ * retain sufficient quality on the larger set. See profiling.md for limits. */
 #define SK_GRAPH_DEG           128
 #define SK_INTERMEDIATE_DEG    256
-#define SK_NN_DESCENT_NITER    100
+#define SK_NN_DESCENT_NITER    64
 
 /* Rows per host->device chunk. Small enough to pipeline with the SQL scan,
  * large enough that DMA launch overhead stays negligible. */

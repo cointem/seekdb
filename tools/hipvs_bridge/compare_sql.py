@@ -22,6 +22,9 @@ def main():
         p.add_argument('--'+name+'-bin',type=Path,required=True)
         p.add_argument('--'+name+'-bridge',type=Path,required=True)
         p.add_argument('--'+name+'-commit',required=True)
+    p.add_argument('--baseline-kind',choices=['frozen','development'],default='frozen')
+    p.add_argument('--baseline-niter',type=int)
+    p.add_argument('--candidate-niter',type=int)
     p.add_argument('--rounds',type=int,default=3);p.add_argument('--port',type=int,default=2982)
     p.add_argument('--output',type=Path,required=True)
     args=p.parse_args()
@@ -30,7 +33,8 @@ def main():
     with socket.socket() as sock:sock.bind(('127.0.0.1',args.port))
     args.output.mkdir(parents=True)
     report={'scope':'alternating fresh-process SQL comparison; not official score','runs':[],
-            'profiling':False,'port':args.port,'binaries':{}}
+            'profiling':False,'port':args.port,'binaries':{},'baseline_kind':args.baseline_kind,
+            'iteration_overrides':{'baseline':args.baseline_niter,'candidate':args.candidate_niter}}
     for name in ('baseline','candidate'):
         binary=getattr(args,name+'_bin').resolve();bridge=getattr(args,name+'_bridge').resolve()
         def digest(path):
@@ -47,6 +51,8 @@ def main():
             run_dir=args.output/f'{round_no}-{name}';run_dir.mkdir()
             base=run_dir/'base';store=run_dir/'store';base.mkdir();store.mkdir()
             env={k:v for k,v in os.environ.items() if not k.startswith(('SEEKDB_VECTOR_PROFILE','SK_CUVS_'))}
+            niter=getattr(args,name+'_niter')
+            if niter is not None:env['SK_CUVS_NN_NITER']=str(niter)
             bridge=getattr(args,name+'_bridge').resolve()
             env['LD_LIBRARY_PATH']=str(bridge.parent)+':/opt/hipvs/lib:/opt/rocm/lib'
             binary=getattr(args,name+'_bin').resolve()
@@ -93,6 +99,7 @@ def main():
         report['gpu_build_plus_first_median_ms']=medians
         report['observed_build_speedup']=medians['baseline']/medians['candidate']
     save();print(args.output/'comparison.json',flush=True)
+    if report['status']!='ok':raise SystemExit(1)
 
 
 if __name__=='__main__':main()
