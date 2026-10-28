@@ -1,7 +1,10 @@
 # AMD vector-index profiling
 
 This workflow is for a **source-built observer and bridge**. Set
-`SEEKDB_VECTOR_PROFILE=1` before starting the observer. No trace-enabled build is
+`SEEKDB_VECTOR_PROFILE=1` and
+`SEEKDB_VECTOR_PROFILE_LOG=/absolute/path/profile.jsonl` before starting the observer.
+The dedicated file is required for seekdb: it redirects stderr to an internal
+log whose independent writes can overwrite diagnostic records. No trace-enabled build is
 required. Normal execution emits no profile records and adds no profile GPU
 synchronization when the switch is absent.
 

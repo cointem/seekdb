@@ -1,13 +1,16 @@
 #pragma once
 
 /* Opt-in diagnostic wall-clock spans shared by the server and GPU bridge.
- * stderr must be captured by the observer launcher. No database/logging ABI. */
+ * Use SEEKDB_VECTOR_PROFILE_LOG for a dedicated append-only file, otherwise
+ * stderr. No database/logging ABI. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/resource.h>
 #include <pthread.h>
 
@@ -39,8 +42,8 @@ static inline void seekdb_vprofile_emit(const char *stage, const void *key,
 #else
   const long rss_kib = usage.ru_maxrss;
 #endif
-  /* One stdio call keeps records intact across threads in this process. */
-  fprintf(stderr, "[seekdb_profile] {\"version\":1,\"pid\":%ld,\"tid\":%llu,"
+  char record[1024];
+  const int length = snprintf(record, sizeof(record), "[seekdb_profile] {\"version\":1,\"pid\":%ld,\"tid\":%llu,"
       "\"stage\":\"%s\",\"key\":\"%p\",\"start_ns\":%lld,\"ms\":%.6f,"
       "\"rows\":%lld,\"dim\":%lld,\"nq\":%lld,\"topk\":%lld,\"rc\":%d,"
       "\"kind\":\"%s\",\"calls\":%lld,\"process_user_ms\":%.3f,"
@@ -48,6 +51,18 @@ static inline void seekdb_vprofile_emit(const char *stage, const void *key,
       (long)getpid(), (unsigned long long)(uintptr_t)pthread_self(), stage, key,
       (long long)start_ns, ms, (long long)rows, (long long)dim,
       (long long)nq, (long long)topk, rc, kind, (long long)calls, user_ms, system_ms, rss_kib);
+  if (length <= 0 || (size_t)length >= sizeof(record)) { return; }
+  const char *path = getenv("SEEKDB_VECTOR_PROFILE_LOG");
+  /* The server logger may redirect stderr and independently manage file offsets.
+   * A dedicated O_APPEND file avoids both overwrite and interleaved stdio writes.
+   * Open per record so no process-global descriptor lifetime leaks into the ABI. */
+  int fd = path != NULL && path[0] != '\0'
+      ? open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600) : STDERR_FILENO;
+  if (fd < 0) { fd = STDERR_FILENO; }
+  ssize_t written;
+  do { written = write(fd, record, (size_t)length); } while (written < 0 && errno == EINTR);
+  (void)written;
+  if (fd != STDERR_FILENO) { close(fd); }
 }
 
 static inline void seekdb_vprofile_span(const char *stage, const void *key,

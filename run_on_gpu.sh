@@ -59,7 +59,7 @@ on_exit() {
   fi
   local -a files=()
   # Exclude driver.log while tee may still be appending to it.
-  for name in bridge-build.log build.log observer.out source_snapshot.json workload report; do
+  for name in bridge-build.log build.log observer.out profile.log source_snapshot.json workload report; do
     [[ -e "$RUN/$name" ]] && files+=("$name")
   done
   tar -czf "$RUN-results.tar.gz" -C "$RUN" "${files[@]}"
@@ -94,6 +94,7 @@ OBSERVER="$SOURCE_DIR/build_release/src/observer/seekdb"
 echo '[3/5] Start an isolated instrumented observer'
 mkdir -p "$RUN/base" "$RUN/store"
 export SEEKDB_VECTOR_PROFILE=1
+export SEEKDB_VECTOR_PROFILE_LOG="$RUN/profile.log"
 export LD_LIBRARY_PATH="$RUN/bridge:/opt/hipvs/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$OBSERVER" --nodaemon --port "$PORT" --base-dir "$RUN/base" --data-dir "$RUN/store" \
   --parameter local_ip=127.0.0.1 --parameter memory_budget=8G \
@@ -114,7 +115,7 @@ python3 tools/hipvs_bridge/profile_workload.py --port "$PORT" --label "$LABEL" -
   --base "$BASE_FILE" --queries "$QUERY_FILE" --dim "$DIM" --n "$N" --nq "$NQ" --rounds "$ROUNDS" \
   --output "$RUN/workload"
 echo '[5/5] Summarize source-level phase timings'
-python3 tools/hipvs_bridge/summarize_profile.py "$RUN/observer.out" \
+python3 tools/hipvs_bridge/summarize_profile.py "$RUN/profile.log" \
   --label "$LABEL" --commit "$COMMIT" --dataset "n$N-d$DIM-q$NQ" \
   --bridge "$RUN/bridge/libseekdb_cuvs_bridge.so" --workload "$RUN/workload/workload.json" \
   --output "$RUN/report"

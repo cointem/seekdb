@@ -143,6 +143,13 @@ int main() {
                 rows,invalid,_=summary.parse_records([path]);self.assertFalse(invalid)
                 counter=next(x for x in rows if x['kind']=='counter')
                 self.assertEqual(counter['calls'],4000);self.assertEqual(counter['rows'],4000)
+            dedicated=Path(tmp)/'dedicated.jsonl'
+            env=dict(os.environ,SEEKDB_VECTOR_PROFILE='1',SEEKDB_VECTOR_PROFILE_LOG=str(dedicated))
+            run=subprocess.run([str(binary)],capture_output=True,text=True,env=env,check=True)
+            self.assertEqual(run.stderr,'')
+            rows,invalid,_=summary.parse_records([dedicated]);self.assertFalse(invalid)
+            counter=next(x for x in rows if x['kind']=='counter')
+            self.assertEqual(counter['calls'],4000)
 
     @unittest.skipUnless(shutil.which('clang'),'clang required')
     def test_bridge_schema_and_failure_ownership_with_fake_gpu(self):
