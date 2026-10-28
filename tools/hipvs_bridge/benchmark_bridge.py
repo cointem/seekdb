@@ -66,6 +66,7 @@ def main():
     p.add_argument('--nq',type=int,default=100);p.add_argument('--rounds',type=int,default=3)
     p.add_argument('--iterations',type=int,nargs='+',default=[100,64,32,16])
     p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--variants',type=Path,help='JSON list of named environment overrides; alternates order per round')
     p.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
     p.add_argument('--truth',type=Path,help=argparse.SUPPRESS)
     args=p.parse_args()
@@ -84,19 +85,28 @@ def main():
         'base_sha256':file_hash(args.base),'queries_sha256':file_hash(args.queries),
         'parameter_overrides':{k:v for k,v in os.environ.items() if k.startswith('SK_CUVS_')}}
     report_path=args.output/'results.json'
+    variants=json.loads(args.variants.read_text()) if args.variants else [
+        {'name':'iter-'+str(i),'environment':{'SK_CUVS_NN_NITER':str(i)}} for i in args.iterations]
+    if not variants or len({v['name'] for v in variants})!=len(variants):p.error('empty or duplicate variants')
+    for v in variants:
+        if not all(c.isalnum() or c in '-_' for c in v['name']):p.error('invalid variant name')
+        if any(not k.startswith('SK_CUVS_') for k in v['environment']):p.error('only SK_CUVS_ overrides allowed')
+    report['variants']=variants
     for round_no in range(args.rounds):
-        order=args.iterations if round_no%2==0 else list(reversed(args.iterations))
-        for iterations in order:
-            env=dict(os.environ,SK_CUVS_NN_NITER=str(iterations),SEEKDB_VECTOR_PROFILE='0')
+        order=variants if round_no%2==0 else list(reversed(variants))
+        for variant in order:
+            env=dict(os.environ,SK_CUVS_NN_NITER='100',SEEKDB_VECTOR_PROFILE='0')
+            env.update({k:str(v) for k,v in variant['environment'].items()})
+            iterations=int(env['SK_CUVS_NN_NITER'])
             cmd=[sys.executable,str(Path(__file__).resolve()),'--worker','--bridge',str(args.bridge.resolve()),
                  '--base',str(args.base.resolve()),'--queries',str(args.queries.resolve()),'--dim',str(args.dim),
                  '--n',str(args.n),'--nq',str(args.nq),'--truth',str(truth_path.resolve()),'--output',str(args.output.resolve())]
             run=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=600)
-            (args.output/f'round-{round_no}-iter-{iterations}.stderr').write_text(run.stderr)
+            (args.output/f'round-{round_no}-{variant["name"]}.stderr').write_text(run.stderr)
             if run.returncode:
-                report['failure']={'round':round_no,'iterations':iterations,'returncode':run.returncode,'stderr':run.stderr}
+                report['failure']={'round':round_no,'variant':variant['name'],'iterations':iterations,'returncode':run.returncode,'stderr':run.stderr}
                 report_path.write_text(json.dumps(report,indent=2));raise RuntimeError(str(report['failure']))
-            result=json.loads(run.stdout);result['round']=round_no;report['runs'].append(result)
+            result=json.loads(run.stdout);result['round']=round_no;result['variant']=variant['name'];report['runs'].append(result)
             report_path.write_text(json.dumps(report,indent=2));print(json.dumps(result),flush=True)
 
 

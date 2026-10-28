@@ -1,0 +1,42 @@
+[
+  {
+    "name": "nn100",
+    "environment": {
+      "SK_CUVS_BUILD_ALGO": "nn_descent",
+      "SK_CUVS_NN_NITER": "100"
+    }
+  },
+  {
+    "name": "pq64-probes32",
+    "environment": {
+      "SK_CUVS_BUILD_ALGO": "ivf_pq",
+      "SK_CUVS_IVF_PROBES": "32",
+      "SK_CUVS_IVF_LISTS": "128",
+      "SK_CUVS_PQ_DIM": "64",
+      "SK_CUVS_REFINE": "2",
+      "SK_CUVS_IVF_BATCH": "128"
+    }
+  },
+  {
+    "name": "pq64-probes48",
+    "environment": {
+      "SK_CUVS_BUILD_ALGO": "ivf_pq",
+      "SK_CUVS_IVF_PROBES": "48",
+      "SK_CUVS_IVF_LISTS": "128",
+      "SK_CUVS_PQ_DIM": "64",
+      "SK_CUVS_REFINE": "2",
+      "SK_CUVS_IVF_BATCH": "128"
+    }
+  },
+  {
+    "name": "pq64-probes64",
+    "environment": {
+      "SK_CUVS_BUILD_ALGO": "ivf_pq",
+      "SK_CUVS_IVF_PROBES": "64",
+      "SK_CUVS_IVF_LISTS": "128",
+      "SK_CUVS_PQ_DIM": "64",
+      "SK_CUVS_REFINE": "2",
+      "SK_CUVS_IVF_BATCH": "128"
+    }
+  }
+]
