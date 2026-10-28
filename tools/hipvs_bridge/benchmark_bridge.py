@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import numpy as np
-from profile_workload import exact_topk, quality
+from profile_workload import exact_topk, quality, file_hash
 
 
 def worker(args):
@@ -73,7 +73,9 @@ def main():
     np.save(truth_path,np.asarray(exact_topk(base,queries,100),dtype=np.int64))
     report={'scope':'bridge only, fresh process per build; not contest score',
         'bridge_sha256':hashlib.sha256(args.bridge.read_bytes()).hexdigest(),
-        'n':args.n,'dim':args.dim,'nq':args.nq,'runs':[]}
+        'n':args.n,'dim':args.dim,'nq':args.nq,'runs':[],
+        'base_sha256':file_hash(args.base),'queries_sha256':file_hash(args.queries),
+        'parameter_overrides':{k:v for k,v in os.environ.items() if k.startswith('SK_CUVS_')}}
     report_path=args.output/'results.json'
     for round_no in range(args.rounds):
         order=args.iterations if round_no%2==0 else list(reversed(args.iterations))

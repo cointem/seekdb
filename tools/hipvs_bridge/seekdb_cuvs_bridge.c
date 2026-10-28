@@ -15,14 +15,12 @@
 #include <string.h>
 #include <time.h>
 
-/* Build-time graph quality. The baseline shipped NN_DESCENT with niter=100,
- * which is far past the point where NN-Descent still improves the graph; the
- * iteration count is the dominant cost of the build stage. Degrees stay at the
- * baseline values because they drive Recall, which is a hard gate. Override
- * with SK_CUVS_* only for sweeps: defaults must reproduce submitted numbers. */
+/* Preserve upstream v5 graph quality by default. Parameter sweeps may override
+ * these values, but faster settings must pass larger-data Recall checks before
+ * becoming defaults. */
 #define SK_GRAPH_DEG           128
 #define SK_INTERMEDIATE_DEG    256
-#define SK_NN_DESCENT_NITER    32
+#define SK_NN_DESCENT_NITER    100
 
 /* Rows per host->device chunk. Small enough to pipeline with the SQL scan,
  * large enough that DMA launch overhead stays negligible. */
@@ -326,10 +324,8 @@ int seekdb_cuvs_search(void *handle, const float *query, long nq, long topk,
   const double t0 = sk_now_ms();
   const int64_t profile_start = sk_profile_begin();
   int64_t phase_start = profile_start;
-  /* CAGRA needs at least one entry point per search_width lane and itopk must
-   * cover topk, otherwise results past Top-64 come back short. The baseline
-   * floor of 512 was a safety margin; itopk scales with topk instead, which
-   * keeps deep Top-k correct without paying 512-wide candidate lists for Top-10. */
+  /* Preserve upstream v5's candidate-list floor and Top-k scaling. Narrower
+   * lists lost Recall on larger development data despite passing the demo. */
   const long itopk_env = sk_env_long("SK_CUVS_ITOPK", 0, 0, 1 << 20);
   const long width_env = sk_env_long("SK_CUVS_SEARCH_WIDTH", 0, 0, 64);
   size_t itopk;
@@ -337,10 +333,10 @@ int seekdb_cuvs_search(void *handle, const float *query, long nq, long topk,
   if (itopk_env > 0) {
     itopk = (size_t)itopk_env;
   } else {
-    itopk = (size_t)topk * 2;
-    if (itopk < 128) itopk = 128;
-    /* itopk_size must be a power of two per the CAGRA contract. */
-    size_t pow2 = 128;
+    itopk = (size_t)topk * 4;
+    if (itopk < 512) itopk = 512;
+    /* Round upward without reducing the upstream candidate-list size. */
+    size_t pow2 = 512;
     while (pow2 < itopk) pow2 <<= 1;
     itopk = pow2;
   }

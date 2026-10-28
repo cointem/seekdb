@@ -54,6 +54,7 @@ OBSERVER=/absolute/path/to/source-built/seekdb
 RUN=/workspace/vector-profile/run-001
 mkdir -p "$RUN/base" "$RUN/store"
 SEEKDB_VECTOR_PROFILE=1 \
+SEEKDB_VECTOR_PROFILE_LOG="$RUN/profile.log" \
 LD_LIBRARY_PATH=/workspace/vector-profile/bridge:/opt/hipvs/lib:/opt/rocm/lib \
 "$OBSERVER" --nodaemon --port 2981 \
   --base-dir "$RUN/base" --data-dir "$RUN/store" \
@@ -101,10 +102,10 @@ included in client latency/QPS. A batch call currently includes its own rebuild;
 do not interpret it as pure search throughput. The fixed official test program
 remains the source of competition scores.
 
-Summarize captured stderr (not just `log/seekdb.log`):
+Summarize the dedicated profile file:
 
 ```bash
-python3 tools/hipvs_bridge/summarize_profile.py "$RUN/observer.out" \
+python3 tools/hipvs_bridge/summarize_profile.py "$RUN/profile.log" \
   --label candidate-001 --commit "$(git rev-parse HEAD)" \
   --dataset n10000-d128 \
   --bridge /workspace/vector-profile/bridge/libseekdb_cuvs_bridge.so \
