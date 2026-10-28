@@ -28,7 +28,7 @@ typedef struct { void *data; struct { int device_type, device_id; } device;
  int ndim; struct { int code, bits, lanes; } dtype; int64_t *shape, *strides; uint64_t byte_offset; } DLTensor;
 typedef struct { DLTensor dl_tensor; void *manager_ctx; void (*deleter)(void*); } DLManagedTensor;
 enum { kDLCPU=1, kDLCUDA=2, kDLFloat=2, kDLUInt=1, CUVS_SUCCESS=0, NN_DESCENT=1,
- NO_FILTER=0, cudaSuccess=0, cudaHostAllocDefault=0, cudaMemcpyHostToDevice=1, cudaMemcpyDefault=4 };
+ NO_FILTER=0, hipSuccess=0, hipHostAllocDefault=0, cudaSuccess=0, cudaHostAllocDefault=0, cudaMemcpyHostToDevice=1, cudaMemcpyDefault=4 };
 typedef void *cuvsResources_t;
 typedef struct Params { int build_algo, graph_degree, intermediate_graph_degree, nn_descent_niter; } *cuvsCagraIndexParams_t;
 typedef struct Index { float *data; long rows, dim; } *cuvsCagraIndex_t;
@@ -60,6 +60,7 @@ static int cuvsRMMFree(cuvsResources_t r,void*p,size_t n) {(void)r;(void)n;free(
 static int cudaMalloc(void **p,size_t n) {*p=malloc(n);++live_device;return 0;}
 static int cudaFree(void*p) {free(p);--live_device;return 0;}
 static int cudaHostAlloc(void **p,size_t n,int flags) {(void)flags;*p=malloc(n);++live_pinned;return 0;}
+static int hipHostAlloc(void **p,size_t n,unsigned int flags) {return cudaHostAlloc(p,n,(int)flags);}
 static int cudaFreeHost(void*p) {free(p);--live_pinned;return 0;}
 static int cudaStreamCreate(cudaStream_t*p) {*p=malloc(1);++live_streams;return 0;}
 static int cudaStreamDestroy(cudaStream_t p) {free(p);--live_streams;return 0;}

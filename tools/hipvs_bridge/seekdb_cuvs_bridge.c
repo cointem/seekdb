@@ -193,7 +193,11 @@ void *seekdb_cuvs_stage_create(long n, long dim)
   const int64_t pinned_start = sk_profile_begin();
   const size_t chunk_bytes = sizeof(float) * (size_t)SK_STAGE_CHUNK_ROWS * (size_t)dim;
   for (int i = 0; i < SK_STAGE_BUFS; ++i) {
+#ifdef __HIP_PLATFORM_AMD__
+    if (hipHostAlloc((void **)&s->pinned[i], chunk_bytes, hipHostAllocDefault) != hipSuccess) {
+#else
     if (cudaHostAlloc((void **)&s->pinned[i], chunk_bytes, cudaHostAllocDefault) != cudaSuccess) {
+#endif
       seekdb_cuvs_stage_free(s);
       return NULL;
     }
