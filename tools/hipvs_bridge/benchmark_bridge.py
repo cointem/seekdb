@@ -18,6 +18,12 @@ def worker(args):
     queries=np.fromfile(args.queries,dtype='<f4').reshape(-1,args.dim)[:args.nq].copy()
     truth=np.load(args.truth)
     lib=C.CDLL(str(args.bridge.resolve()))
+    pool_percent=int(os.environ.get('SK_CUVS_RMM_POOL_PERCENT','0'))
+    if pool_percent:
+        lib.cuvsRMMPoolMemoryResourceEnable.argtypes=[C.c_int,C.c_int,C.c_bool]
+        lib.cuvsRMMPoolMemoryResourceEnable.restype=C.c_int
+        if lib.cuvsRMMPoolMemoryResourceEnable(1,pool_percent,False)!=0:
+            raise RuntimeError('RMM pool initialization failed')
     ptr=C.c_void_p
     lib.seekdb_cuvs_build.argtypes=[ptr,C.c_long,C.c_long];lib.seekdb_cuvs_build.restype=ptr
     lib.seekdb_cuvs_search.argtypes=[ptr,ptr,C.c_long,C.c_long,ptr,ptr];lib.seekdb_cuvs_search.restype=C.c_int
