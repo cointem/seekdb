@@ -31,7 +31,7 @@ enum { kDLCPU=1, kDLCUDA=2, kDLFloat=2, kDLUInt=1, CUVS_SUCCESS=0, NN_DESCENT=1,
  NO_FILTER=0, hipSuccess=0, hipHostAllocDefault=0, cudaSuccess=0, cudaHostAllocDefault=0, cudaMemcpyHostToDevice=1, cudaMemcpyDefault=4 };
 typedef void *cuvsResources_t;
 typedef struct IvfBuild {uint32_t n_lists,pq_dim;} *cuvsIvfPqIndexParams_t;
-typedef struct IvfSearch {uint32_t n_probes;} *cuvsIvfPqSearchParams_t;
+typedef struct IvfSearch {uint32_t n_probes,max_internal_batch_size;} *cuvsIvfPqSearchParams_t;
 struct cuvsIvfPqParams {cuvsIvfPqIndexParams_t ivf_pq_build_params; cuvsIvfPqSearchParams_t ivf_pq_search_params;float refinement_rate;};
 static int cuvsIvfPqIndexParamsCreate(cuvsIvfPqIndexParams_t*p) {*p=(cuvsIvfPqIndexParams_t)calloc(1,sizeof(**p));return *p?0:1;}
 static int cuvsIvfPqSearchParamsCreate(cuvsIvfPqSearchParams_t*p) {*p=(cuvsIvfPqSearchParams_t)calloc(1,sizeof(**p));return *p?0:1;}

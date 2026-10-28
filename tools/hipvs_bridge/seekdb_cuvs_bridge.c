@@ -146,6 +146,7 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
     pq_params.ivf_pq_build_params->pq_dim = (uint32_t)sk_env_long("SK_CUVS_PQ_DIM", dim / 2, 0, dim);
     pq_params.ivf_pq_search_params->n_probes = (uint32_t)sk_env_long("SK_CUVS_IVF_PROBES", 32, 1,
         pq_params.ivf_pq_build_params->n_lists);
+    pq_params.ivf_pq_search_params->max_internal_batch_size = (uint32_t)sk_env_long("SK_CUVS_IVF_BATCH", 256, 1, 65536);
     pq_params.refinement_rate = (float)sk_env_long("SK_CUVS_REFINE", 4, 1, 64);
     h->ip->graph_build_params = &pq_params;
   }
