@@ -27,7 +27,7 @@ FAKE_API = r'''
 typedef struct { void *data; struct { int device_type, device_id; } device;
  int ndim; struct { int code, bits, lanes; } dtype; int64_t *shape, *strides; uint64_t byte_offset; } DLTensor;
 typedef struct { DLTensor dl_tensor; void *manager_ctx; void (*deleter)(void*); } DLManagedTensor;
-enum { kDLCPU=1, kDLCUDA=2, kDLFloat=2, kDLUInt=1, CUVS_SUCCESS=0, NN_DESCENT=1,
+enum { kDLCPU=1, kDLCUDA=2, kDLFloat=2, kDLUInt=1, CUVS_SUCCESS=0, NN_DESCENT=1, IVF_PQ=2, ITERATIVE_CAGRA_SEARCH=3,
  NO_FILTER=0, hipSuccess=0, hipHostAllocDefault=0, cudaSuccess=0, cudaHostAllocDefault=0, cudaMemcpyHostToDevice=1, cudaMemcpyDefault=4 };
 typedef void *cuvsResources_t;
 typedef struct Params { int build_algo, graph_degree, intermediate_graph_degree, nn_descent_niter; } *cuvsCagraIndexParams_t;

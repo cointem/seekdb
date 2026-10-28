@@ -117,6 +117,7 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   const long igd   = sk_env_long("SK_CUVS_INTERMEDIATE_DEG", SK_INTERMEDIATE_DEG, 2, 8192);
   const long niter = sk_env_long("SK_CUVS_NN_NITER", SK_NN_DESCENT_NITER, 1, 10000);
 
+  const char *build_algo = getenv("SK_CUVS_BUILD_ALGO");
   const int64_t resource_start = sk_profile_begin();
   int64_t build_start = 0;
   double t0 = 0, t1 = 0;
@@ -125,6 +126,16 @@ static void *sk_cagra_build(DLManagedTensor *dset, long n, long dim, sk_cuvs_sta
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) { goto fail_res; }
   h->ip->build_algo = NN_DESCENT;
+  if (build_algo != NULL && build_algo[0] != '\0') {
+    if (strcmp(build_algo, "ivf_pq") == 0) {
+      h->ip->build_algo = IVF_PQ;
+    } else if (strcmp(build_algo, "iterative") == 0) {
+      h->ip->build_algo = ITERATIVE_CAGRA_SEARCH;
+    } else if (strcmp(build_algo, "nn_descent") != 0) {
+      fprintf(stderr, "[seekdb_cuvs] invalid SK_CUVS_BUILD_ALGO\n");
+      goto fail_ip;
+    }
+  }
   h->ip->graph_degree = gd;
   h->ip->intermediate_graph_degree = igd;
   h->ip->nn_descent_niter = niter;
