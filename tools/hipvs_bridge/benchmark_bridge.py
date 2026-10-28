@@ -107,7 +107,10 @@ def main():
             if run.returncode:
                 report['failure']={'round':round_no,'variant':variant['name'],'iterations':iterations,'returncode':run.returncode,'stderr':run.stderr}
                 report_path.write_text(json.dumps(report,indent=2));raise RuntimeError(str(report['failure']))
-            result=json.loads(run.stdout);result['round']=round_no;result['variant']=variant['name'];report['runs'].append(result)
+            result=json.loads(run.stdout);result['round']=round_no;result['variant']=variant['name']
+            result['backend_build_errors']=run.stderr.count('CAGRA build error:')
+            result['gpu_algorithm_retries']=run.stderr.count('retrying GPU NN-Descent')
+            report['runs'].append(result)
             report_path.write_text(json.dumps(report,indent=2));print(json.dumps(result),flush=True)
 
 

@@ -53,6 +53,7 @@ def main():
     parser.add_argument('--n', type=int, default=10000)
     parser.add_argument('--nq', type=int, default=100)
     parser.add_argument('--rounds', type=int, default=3)
+    parser.add_argument('--libraries',nargs='+',choices=['vsag','cuvs'],default=['vsag','cuvs'])
     parser.add_argument('--ef-search', type=int, default=64)
     parser.add_argument('--label', required=True)
     parser.add_argument('--commit', default='unknown')
@@ -82,7 +83,7 @@ def main():
     args.output.mkdir(parents=True)
     database = 'vp_' + str(time.time_ns())
     report = dict(version=1,label=args.label,commit=args.commit,database=database,
-                  n=args.n,dim=args.dim,nq=args.nq,rounds=args.rounds,
+                  n=args.n,dim=args.dim,nq=args.nq,rounds=args.rounds,libraries=args.libraries,
                   ef_search=args.ef_search,base_sha256=file_hash(args.base),queries_sha256=file_hash(args.queries),
                   mode='fresh_index_warm_process',cases=[],status='running',
                   caveats=['SQL latencies include mysql CLI startup and connections.',
@@ -111,6 +112,7 @@ def main():
         insert('probes',range(100000,100000+args.nq),queries)
         for round_no in range(args.rounds):
             for lib in (['vsag','cuvs'] if round_no%2==0 else ['cuvs','vsag']):
+                if lib not in args.libraries:continue
                 table=f't_{lib}_{round_no}'
                 case=dict(round=round_no,lib=lib,table=table,status='running')
                 report['cases'].append(case);save()

@@ -31,6 +31,7 @@ def main():
     p.add_argument('--baseline-kind',choices=['frozen','development'],default='frozen')
     p.add_argument('--baseline-niter',type=int)
     p.add_argument('--candidate-niter',type=int)
+    p.add_argument('--gpu-only',action='store_true',help='omit unchanged CPU control; record this scope explicitly')
     p.add_argument('--rounds',type=int,default=3);p.add_argument('--port',type=int,default=2982)
     p.add_argument('--output',type=Path,required=True)
     args=p.parse_args()
@@ -39,7 +40,7 @@ def main():
     with socket.socket() as sock:sock.bind(('127.0.0.1',args.port))
     args.output.mkdir(parents=True)
     report={'scope':'alternating fresh-process SQL comparison; not official score','runs':[],
-            'profiling':False,'port':args.port,'binaries':{},'baseline_kind':args.baseline_kind,
+            'profiling':False,'gpu_only':args.gpu_only,'port':args.port,'binaries':{},'baseline_kind':args.baseline_kind,
             'iteration_overrides':{'baseline':args.baseline_niter,'candidate':args.candidate_niter}}
     for name in ('baseline','candidate'):
         env_path=getattr(args,name+'_env')
@@ -86,12 +87,18 @@ def main():
                         '--port',str(args.port),'--rounds','1','--label',name,'--commit',getattr(args,name+'_commit'),
                         '--output',str(run_dir/'workload'),'--base',str(args.base),'--queries',str(args.queries),
                         '--dim',str(args.dim),'--n',str(args.n),'--nq',str(args.nq)]
+                    if args.gpu_only:workload+=['--libraries','cuvs']
                     with (run_dir/'workload.log').open('w') as out:
                         run=subprocess.run(workload,env=env,stdout=out,stderr=subprocess.STDOUT,timeout=900)
                     result['status']='ok' if run.returncode==0 else 'failed'
                     path=run_dir/'workload'/'workload.json'
                     if path.exists():result['workload']=json.loads(path.read_text())
                     result['returncode']=run.returncode
+                    server_log=base/'log'/'seekdb.log'
+                    result['gpu_algorithm_retries']=0
+                    if server_log.exists():
+                        with server_log.open(errors='replace') as source:
+                            result['gpu_algorithm_retries']=sum('retrying GPU NN-Descent' in line for line in source)
                 except Exception as error:
                     result['status']='failed';result['error']=str(error)
                 finally:

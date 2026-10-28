@@ -349,6 +349,18 @@ static void *sk_build_host(const float *base, long n, long dim)
 static void *sk_build_impl(const float *base, long n, long dim)
 {
   if (base == NULL || n <= 0 || dim <= 0) { return NULL; }
+  const char *algo = getenv("SK_CUVS_BUILD_ALGO");
+  const int automatic = algo == NULL || algo[0] == '\0' || strcmp(algo, "auto") == 0;
+  if ((automatic && n >= 8192 && dim >= 16 && dim % 4 == 0) ||
+      (algo != NULL && strcmp(algo, "ivf_pq") == 0)) {
+    /* hipVS 26.03 device refinement cannot handle the intermediate degree
+     * 256. Its supported host-input CAGRA path performs FP32 refinement on
+     * the host while IVF-PQ training/candidate search and final ANN search
+     * remain on the GPU. Select it up front, avoiding a failed device build
+     * and duplicate training. All work remains inside the build timer. */
+    seekdb_vprofile_span("route.host_input_refinement", base, sk_profile_begin(), n, dim, 0, 0, 0);
+    return sk_build_host(base, n, dim);
+  }
   void *s = seekdb_cuvs_stage_create(n, dim);
   if (s != NULL) {
     if (seekdb_cuvs_stage_put(s, base, 0, n) == 0) {

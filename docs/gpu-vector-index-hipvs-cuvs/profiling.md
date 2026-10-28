@@ -196,7 +196,14 @@ replace a complete Linux/ROCm observer build.
 The default bridge now constructs CAGRA from IVF-PQ candidates followed by
 FP32 refinement when `n >= 8192`, `dim >= 16`, and `dim` is divisible by four.
 It uses 128 coarse partitions, 64 probes, PQ subspaces of four coordinates,
-refinement rate 2, and internal query batches of 128. The stored dataset and
+refinement rate 2, and internal query batches of 128. On hipVS 26.03 this uses
+the supported host-input CAGRA path: IVF-PQ training/candidate search execute on
+the GPU, FP32 candidate refinement executes on the CPU, and the resulting CAGRA
+index and ANN search reside on the GPU. Device-input refinement rejects the
+256-entry intermediate graph; choosing host input before building avoids a
+failed device attempt and duplicate training. This is not a CPU VSAG index.
+All refinement, transfers, and GPU completion stay within the build timer.
+The stored dataset and
 query distance computation remain FP32. Graph degree 128, intermediate degree
 256, and search candidate floor 512 are unchanged. This is approximate graph
 construction and must still pass Recall checks on the evaluation data.
