@@ -208,7 +208,8 @@ query distance computation remain FP32. Graph degree 128, intermediate degree
 256, and search candidate floor 512 are unchanged. This is approximate graph
 construction and must still pass Recall checks on the evaluation data.
 
-Smaller or unsupported shapes use NN-Descent (64 iterations). If the automatic
+Smaller or unsupported shapes retain upstream-v5 NN-Descent (100 iterations),
+so the new fast path does not reduce their construction quality. If the automatic
 IVF-PQ build fails, the bridge destroys the incomplete index and retries
 NN-Descent on the GPU. Both attempts remain inside the build timer; no previous
 index is reused. Explicit algorithm overrides fail visibly instead of retrying,

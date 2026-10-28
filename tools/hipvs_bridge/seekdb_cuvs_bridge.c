@@ -21,7 +21,7 @@
  * See profiling.md for measured scope and comparison limitations. */
 #define SK_GRAPH_DEG           128
 #define SK_INTERMEDIATE_DEG    256
-#define SK_NN_DESCENT_NITER    64
+#define SK_NN_DESCENT_NITER    100
 
 /* Rows per host->device chunk. Small enough to pipeline with the SQL scan,
  * large enough that DMA launch overhead stays negligible. */
