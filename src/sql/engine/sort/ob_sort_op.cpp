@@ -330,9 +330,6 @@ int ObSortOp::scan_all_then_sort()
 
 int ObSortOp::scan_all_then_sort_batch()
 {
-  if (sort_impl_.use_fts_prescan_handoff()) {
-    return scan_all_then_sort_fts_batch();
-  }
   int ret = OB_SUCCESS;
   SMART_VAR(ObCompactStore, cache_store) {
     if (OB_FAIL(cache_store.init(16 * 1024,
@@ -384,37 +381,6 @@ int ObSortOp::scan_all_then_sort_batch()
         }
       }
     }
-  }
-  return ret;
-}
-
-int ObSortOp::scan_all_then_sort_fts_batch()
-{
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(sort_impl_.init_fts_prescan())) {
-  }
-  bool end = false;
-  while (OB_SUCC(ret) && !end) {
-    clear_evaluated_flag();
-    const ObBatchRows *input = nullptr;
-    if (OB_FAIL(try_check_status())) {
-    } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input))) {
-      if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
-        end = true;
-      }
-    } else if (OB_ISNULL(input)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      if (input->size_ > 0) {
-        sort_row_count_ += input->size_ - input->skip_->accumulate_bit_cnt(input->size_);
-        ret = sort_impl_.add_fts_prescan_batch(MY_SPEC.all_exprs_, *input->skip_, input->size_);
-      }
-      end = input->end_;
-    }
-  }
-  if (OB_SUCC(ret)) {
-    ret = sort_impl_.finish_fts_prescan();
   }
   return ret;
 }

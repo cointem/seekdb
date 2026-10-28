@@ -113,16 +113,50 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// ob_casedn_utf8mb4 decodes, applies caseinfo->page[wc].tolower and
+// reencodes. For valid CJK characters whose actual table entry is identity,
+// both conversion and its temporary allocation can be skipped. Keep all other
+// non-ASCII scripts/charsets on ObCharset::tolower (including invalid UTF-8).
+bool ft_word_lower_identity(const ObCharsetInfo *cs, bool utf8,
+                            const char *word, int64_t length)
+{
+  if (nullptr == cs || cs->mbminlen != 1) { return false; }
+  const unsigned char *cursor = reinterpret_cast<const unsigned char *>(word);
+  const unsigned char *end = cursor + length;
+  while (cursor < end) {
+    if (*cursor < 128) {
+      if (*cursor >= 'A' && *cursor <= 'Z') { return false; }
+      ++cursor;
+    } else {
+      if (!utf8 || nullptr == cs->caseinfo) { return false; }
+      ob_wc_t wc = 0;
+      const int bytes = cs->cset->mb_wc(cs, &wc, cursor, end);
+      if (bytes <= 0 || !((wc >= 0x3400 && wc <= 0x4DBF)
+          || (wc >= 0x4E00 && wc <= 0x9FFF) || (wc >= 0x20000 && wc <= 0x2FA1F))) {
+        return false;
+      }
+      if (wc <= cs->caseinfo->maxchar) {
+        const ObUnicaseInfoChar *page = cs->caseinfo->page[wc >> 8];
+        if (nullptr != page && page[wc & 0xFF].tolower != wc) { return false; }
+      }
+      cursor += bytes;
+    }
+  }
+  return true;
+}
+
 // class ObAddWord
 ObAddWord::ObAddWord(
     const ObFTParserProperty &property,
     const ObObjMeta &meta,
     const ObAddWordFlag &flag,
     common::ObIAllocator &allocator,
-    ObFTWordMap &word_map)
+    ObFTWordMap &word_map,
+    common::ObArenaAllocator *normalization)
   : word_meta_(meta),
     allocator_(allocator),
     word_map_(word_map),
+    normalization_(normalization),
     min_max_word_cnt_(0),
     non_stopword_cnt_(0),
     stopword_cnt_(0),
@@ -138,6 +172,19 @@ int ObAddWord::process_word(
     const int64_t char_cnt,
     const int64_t word_freq)
 {
+  return process_word_impl(word, word_len, char_cnt, word_freq, false);
+}
+
+int ObAddWord::process_word_view(const char *word, int64_t word_len,
+                                 int64_t char_cnt, int64_t word_freq)
+{
+  if (flag_.casedown() && nullptr != normalization_) { normalization_->reuse(); }
+  return process_word_impl(word, word_len, char_cnt, word_freq, true);
+}
+
+int ObAddWord::process_word_impl(const char *word, int64_t word_len,
+                                 int64_t char_cnt, int64_t word_freq, bool borrowed)
+{
   int ret = OB_SUCCESS;
   bool is_stopword = false;
   ObFTWord src_word(word_len, word, word_meta_);
@@ -146,11 +193,11 @@ int ObAddWord::process_word(
     ret = OB_INVALID_ARGUMENT;
   } else if (is_min_max_word(char_cnt)) {
     ++min_max_word_cnt_;
-  } else if (OB_FAIL(casedown_word(src_word, dst_word))) {
+  } else if (OB_FAIL(casedown_word(src_word, dst_word, borrowed))) {
   } else if (OB_FAIL(check_stopword(dst_word, is_stopword))) {
   } else if (OB_UNLIKELY(is_stopword)) {
     ++stopword_cnt_;
-  } else if (OB_FAIL(groupby_word(dst_word, word_freq))) {
+  } else if (OB_FAIL(groupby_word(dst_word, word_freq, borrowed))) {
   } else {
     non_stopword_cnt_ += word_freq;
   }
@@ -162,18 +209,24 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
-int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
+int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst, bool borrowed)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (borrowed && flag_.casedown()
+      && ObCharset::charset_type_by_coll(word_meta_.get_collation_type()) == CHARSET_UTF8MB4
+      && ft_word_lower_identity(ObCharset::get_charset(word_meta_.get_collation_type()),
+          ObCharset::charset_type_by_coll(word_meta_.get_collation_type()) == CHARSET_UTF8MB4,
+          src.get_word().ptr_, src.get_word().len_)) {
+    dst = src;
   } else if (flag_.casedown()) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
                     src.get_word().get_string(),
                     dst_str,
-                    allocator_))) {
+                    borrowed && nullptr != normalization_ ? *normalization_ : allocator_))) {
     } else {
       ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
       dst = tmp;
@@ -199,11 +252,43 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
   return ret;
 }
 
-int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
+int ObAddWord::retain_word(const ObFTWord &word, ObFTWord &retained)
+{
+  ObString copy;
+  const int ret = ob_write_string(allocator_, word.get_word().get_string(), copy);
+  if (OB_SUCCESS == ret) { retained = ObFTWord(copy.length(), copy.ptr(), word_meta_); }
+  return ret;
+}
+
+int ObAddWord::groupby_word(const ObFTWord &word, int64_t word_freq, bool borrowed)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (borrowed) {
+    // Retain only a missing key or changed last spelling, within one lookup.
+    // Return callback errors explicitly so an OOM cannot be overwritten by a
+    // successful lookup status, and never publish transient parser/scratch data.
+    auto update = [&](auto &entry) -> int {
+      int result = OB_SUCCESS;
+      if (!flag_.groupby_word()) { result = OB_HASH_EXIST; }
+      else {
+        if (entry.first.get_word().get_string() != word.get_word().get_string()) {
+          ObFTWord retained;
+          if (OB_SUCCESS != (result = retain_word(word, retained))) {
+          } else { entry.first = retained; }
+        }
+        if (OB_SUCCESS == result) { entry.second += word_freq; }
+      }
+      return result;
+    };
+    auto prepare = [&](auto &entry) -> int {
+      ObFTWord retained;
+      const int result = retain_word(word, retained);
+      if (OB_SUCCESS == result) { entry.first = retained; }
+      return result;
+    };
+    ret = word_map_.set_or_update(word, 1/*legacy first occurrence*/, update, prepare);
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }

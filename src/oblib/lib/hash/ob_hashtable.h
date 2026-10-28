@@ -1359,6 +1359,37 @@ public:
     return set_or_update(key, value, callback, preproc_);
   }
 
+  // Deferred-value variant: preserve the lookup key while prepare replaces
+  // borrowed storage in value before internal_set publishes the new node.
+  // Both callbacks return int; no allocation, size change or publication occurs
+  // on a prepare error. Callbacks must not re-enter this table.
+  template<class _callback, class _prepare>
+  int set_or_update_with_prepare(const _key_type &key, _value_type &value,
+                                 _callback &callback, _prepare &prepare)
+  {
+    int ret = OB_SUCCESS;
+    uint64_t hash_value = 0;
+    if (OB_UNLIKELY(!inited(buckets_)) || OB_UNLIKELY(NULL == allocer_)) {
+      HASH_WRITE_LOG(HASH_WARNING, "hashtable not init");
+      ret = OB_NOT_INIT;
+    } else if (OB_FAIL(hashfunc_(key, hash_value))) {
+      HASH_WRITE_LOG(HASH_WARNING, "hash key failed, ret = %d", ret);
+    } else {
+      hashbucket &bucket = buckets_[hash_value % bucket_num_];
+      bucket_lock_cond blc(bucket);
+      writelocker locker(blc.lock());
+      hashnode *node = bucket.node;
+      while (NULL != node && !equal_(getkey_(node->data), key)) { node = node->next; }
+      if (NULL != node) {
+        ret = callback(preproc_(node->data));
+      } else if (OB_FAIL(prepare(preproc_(value)))) {
+      } else {
+        ret = internal_set(bucket, value, false);
+      }
+    }
+    return ret;
+  }
+
   int erase_refactored(const _key_type &key, _value_type *value = NULL)
   {
     int ret = OB_SUCCESS;

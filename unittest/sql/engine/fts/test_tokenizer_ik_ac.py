@@ -56,6 +56,18 @@ def statements(oracle=False):
         options = json.dumps([{"additional_args": [{"dict_table": dictionary}, {"ik_mode": "smart"}]}])
         expr = expression(literal("北京大学生 一百公斤 Alpha"), "ik", options, "utf8mb4_bin", oracle)
         sql.append(f"SELECT 'dictionary-{dictionary}', {expr};")
+    # ALL uses the ordinary frequency/document-length sink. The nonconstant
+    # parser retains its one-shot DAT iterator, so this compares more than just
+    # unique membership (including repeat counts, arbitration and last spelling).
+    normal_texts = seeds + ["Alpha alpha ALPHA alpha 数据库 数据库 北京大学生 " * 120,
+                            "q " * 1100 + "12万千米 北京大学生 一百公斤", "tail",
+                            "中国人民银行 " * 5000, "tail"]
+    for smart in ("smart", "max_word"):
+        options = json.dumps([{"output": "all"}, {"additional_args": [{"ik_mode": smart}]}])
+        for coll in ("utf8mb4_bin", "utf8mb4_general_ci", "utf8mb4_unicode_ci"):
+            for index, text in enumerate(normal_texts):
+                expr = expression(literal(text), "ik", options, coll, oracle)
+                sql.append(f"SELECT 'normal-{smart}-{coll}-{index}', {expr};")
     return sql
 
 
@@ -90,12 +102,10 @@ def main():
         args.snapshot.write_text(json.dumps(actual, ensure_ascii=False, sort_keys=True) + "\n")
     if args.compare:
         reference = json.loads(args.compare.read_text())
-        if not any(key.startswith("deferred-") for key in reference):
-            original = {key: value for key, value in actual.items() if not key.startswith("deferred-")}
-            assert original == reference, "original baseline ordered output differs"
-            print(f"Baseline: {len(reference)} original keys; extra deferred keys checked against DAT oracle")
-        else:
-            assert actual == reference, "baseline ordered output differs"
+        # Existing snapshots predate normal-sink coverage (and some predate
+        # deferred groups). Every old key is still compared against its oracle.
+        compared = {key: value for key, value in actual.items() if key in reference}
+        assert compared == reference, "baseline ordered output differs"
     small_sql = [sql for sql in statements() if len(sql) < 12000]
     expected = run(command, small_sql, args.timeout)
 

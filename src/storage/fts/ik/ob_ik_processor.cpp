@@ -58,7 +58,7 @@ public:
   }
 };
 
-bool TokenizeContext::enable_default_pipeline(uint64_t generation)
+bool TokenizeContext::enable_decoded_pipeline(uint64_t generation)
 {
   decoded_enabled_ = false;
   if (cursor_ != 0 || fulltext_len_ <= 0 || fulltext_len_ > IKDecodedChars::MAX_DOCUMENT_BYTES
@@ -97,13 +97,13 @@ bool TokenizeContext::enable_default_pipeline(uint64_t generation)
   return true;
 }
 
-void TokenizeContext::disable_default_pipeline()
+void TokenizeContext::disable_decoded_pipeline()
 {
   decoded_enabled_ = false;
   if (nullptr != decoded_) { decoded_->reuse(); }
 }
 
-bool TokenizeContext::default_pipeline_enabled() const { return decoded_enabled_; }
+bool TokenizeContext::decoded_pipeline_enabled() const { return decoded_enabled_; }
 ob_wc_t TokenizeContext::current_unicode() const { return decoded_->chars_.at(decoded_->current_).unicode_; }
 int64_t TokenizeContext::current_char_index() const { return decoded_->current_; }
 int64_t TokenizeContext::char_offset(int64_t index) const { return decoded_->chars_.at(index).offset_; }
@@ -194,7 +194,7 @@ int TokenizeContext::init()
 int TokenizeContext::restart(const char *fulltext, int64_t fulltext_len, bool is_smart)
 {
   reset_resource();
-  disable_default_pipeline();
+  disable_decoded_pipeline();
   fulltext_ = fulltext;
   fulltext_len_ = fulltext_len;
   is_smart_ = is_smart;

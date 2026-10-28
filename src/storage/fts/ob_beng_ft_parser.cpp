@@ -30,58 +30,49 @@ namespace oceanbase
 namespace storage
 {
 
-int try_beng_ascii_unique(const ObCharsetInfo *cs, const ObObjMeta &meta,
-                          const ObFTParserProperty &property,
-                          const char *text, int64_t length,
-                          FTUniqueTerms &terms, bool &handled)
+namespace {
+// Validate the whole input before publishing a token: an optimization miss can
+// replay the original pipeline without rolling frequency counters or maps back.
+bool beng_ascii_supported(const ObCharsetInfo *cs, const char *text, int64_t length)
 {
-  int ret = OB_SUCCESS;
-  handled = false;
   const ObCharsetInfo *utf8 = ObCharset::get_charset(CS_TYPE_UTF8MB4_BIN);
-  if (nullptr == cs || nullptr == utf8 || nullptr == text || length <= 0
-      || terms.size() != 0 || terms.overflow()
-      || ObCharset::charset_type_by_coll(meta.get_collation_type()) != CHARSET_UTF8MB4
+  if (nullptr == cs || nullptr == utf8 || nullptr == text || length <= 0 || length > UINT32_MAX
       || cs->cset != utf8->cset || cs->mbminlen != 1 || nullptr == cs->ctype
       || nullptr == cs->caseinfo || cs->caseinfo->maxchar < 127
-      || nullptr == cs->caseinfo->page || nullptr == cs->caseinfo->page[0]
-      || property.min_token_size_ < 0 || property.max_token_size_ > ObBEngFTParser::FT_MAX_WORD_LEN) {
-    return ret;
+      || nullptr == cs->caseinfo->page || nullptr == cs->caseinfo->page[0]) {
+    return false;
   }
   const unsigned char *ctype = cs->ctype + 1;
   const ObUnicaseInfoChar *case_page = cs->caseinfo->page[0];
   const unsigned delimiter_flags = _MY_SPC | _MY_CTR | _MY_PNT;
-  const unsigned alnum_flags = _MY_U | _MY_L | _MY_NMR;
-  // Prove the whole input is eligible BEFORE publishing any term. UTF8's
-  // actual casedn handler maps ASCII through this Unicode page; never infer it
-  // from to_lower[], which would miss Turkish I -> non-ASCII mappings.
   int64_t run_length = 0;
   for (int64_t i = 0; i < length; ++i) {
     const unsigned char c = static_cast<unsigned char>(text[i]);
-    if (c >= 0x80) {
-      return ret;
-    }
+    if (c >= 0x80) { return false; }
     const uint32_t expected_lower = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
-    if (case_page[c].tolower != expected_lower) {
-      return ret;
-    }
+    // UTF8 uses this Unicode page, including Turkish I -> non-ASCII mappings.
+    if (case_page[c].tolower != expected_lower) { return false; }
     run_length = (ctype[c] & delimiter_flags) != 0 ? 0 : run_length + 1;
-    // Very large raw tokens use the original pipeline, including its rejection
-    // and trimming semantics. The caller can replay without rolling terms back.
-    if (run_length > 512) {
-      return ret;
-    }
+    if (run_length > 512) { return false; }
   }
-  handled = true;
-  ObStopWordChecker *checker = ObFTParseData::instance().stop_word_checker();
+  return true;
+}
+
+template <typename Sink>
+int beng_ascii_scan(const ObCharsetInfo *cs, const ObFTParserProperty &property,
+                    const char *text, int64_t length, Sink &sink)
+{
+  int ret = OB_SUCCESS;
+  const unsigned char *ctype = cs->ctype + 1;
+  const ObUnicaseInfoChar *case_page = cs->caseinfo->page[0];
+  const unsigned delimiter_flags = _MY_SPC | _MY_CTR | _MY_PNT;
+  const unsigned alnum_flags = _MY_U | _MY_L | _MY_NMR;
   char lowercase[ObBEngFTParser::FT_MAX_WORD_LEN];
   int64_t cursor = 0;
-  while (OB_SUCC(ret) && cursor < length && !terms.overflow()) {
+  while (OB_SUCC(ret) && cursor < length) {
     while (cursor < length
-        && (ctype[static_cast<unsigned char>(text[cursor])] & delimiter_flags) != 0) {
-      ++cursor;
-    }
-    int64_t first_alnum = -1;
-    int64_t last_alnum = -1;
+        && (ctype[static_cast<unsigned char>(text[cursor])] & delimiter_flags) != 0) { ++cursor; }
+    int64_t first_alnum = -1, last_alnum = -1;
     bool uppercase = false;
     while (cursor < length
         && (ctype[static_cast<unsigned char>(text[cursor])] & delimiter_flags) == 0) {
@@ -95,8 +86,7 @@ int try_beng_ascii_unique(const ObCharsetInfo *cs, const ObObjMeta &meta,
     }
     if (first_alnum >= 0) {
       const int64_t token_length = last_alnum - first_alnum + 1;
-      // Normal BENG applies min/max AFTER trimming and normalizing. Proven
-      // single-byte ASCII case mapping makes byte length == character length.
+      // BENG applies min/max to trimmed, normalized bytes (ASCII chars here).
       if (token_length >= property.min_token_size_ && token_length <= property.max_token_size_) {
         const char *word = text + first_alnum;
         if (uppercase) {
@@ -105,20 +95,51 @@ int try_beng_ascii_unique(const ObCharsetInfo *cs, const ObObjMeta &meta,
           }
           word = lowercase;
         }
-        ObFTWord key(token_length, word, meta);
-        bool stop = false;
-        if (nullptr == checker) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(checker->check_stopword(key, stop))) {
-        } else if (!stop) {
-          // add() retains stack spellings before the next token, borrowing
-          // unchanged lowercase input and preserving its legacy bucket order.
-          ret = terms.add(key, meta);
-        }
+        ret = sink(word, token_length);
+        if (ret == OB_ITER_END) { ret = OB_SUCCESS; break; }
       }
     }
   }
   return ret;
+}
+}
+
+int try_beng_ascii_segment(const ObCharsetInfo *cs, const ObFTParserProperty &property,
+                           const char *text, int64_t length, ObAddWord &add_word,
+                           bool &handled)
+{
+  handled = property.min_token_size_ >= 0 && property.max_token_size_ <= ObBEngFTParser::FT_MAX_WORD_LEN
+      && beng_ascii_supported(cs, text, length);
+  if (!handled) { return OB_SUCCESS; }
+  auto sink = [&](const char *word, int64_t size) {
+    // Synchronous retention keeps stack/lowercase and input views out of the
+    // persistent word map; every occurrence reaches the frequency/length sink.
+    return add_word.process_word_view(word, size, size, 1);
+  };
+  return beng_ascii_scan(cs, property, text, length, sink);
+}
+
+int try_beng_ascii_unique(const ObCharsetInfo *cs, const ObObjMeta &meta,
+                          const ObFTParserProperty &property,
+                          const char *text, int64_t length,
+                          FTUniqueTerms &terms, bool &handled)
+{
+  handled = terms.size() == 0 && !terms.overflow()
+      && ObCharset::charset_type_by_coll(meta.get_collation_type()) == CHARSET_UTF8MB4
+      && property.min_token_size_ >= 0 && property.max_token_size_ <= ObBEngFTParser::FT_MAX_WORD_LEN
+      && beng_ascii_supported(cs, text, length);
+  if (!handled) { return OB_SUCCESS; }
+  ObStopWordChecker *checker = ObFTParseData::instance().stop_word_checker();
+  auto sink = [&](const char *word, int64_t size) {
+    int ret = OB_SUCCESS;
+    ObFTWord key(size, word, meta);
+    bool stop = false;
+    if (nullptr == checker) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(checker->check_stopword(key, stop))) {
+    } else if (!stop) { ret = terms.add(key, meta); }
+    return OB_SUCC(ret) && terms.overflow() ? OB_ITER_END : ret;
+  };
+  return beng_ascii_scan(cs, property, text, length, sink);
 }
 
 int ObBEngFTParser::get_next_token(const char *&word, int64_t &word_len,

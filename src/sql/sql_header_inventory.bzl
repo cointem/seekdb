@@ -1239,6 +1239,7 @@ SQL_PRIVATE_HEADERS = [
     "resolver/tcl/ob_start_trans_stmt.h",
     "resolver/tcl/ob_tcl_resolver.h",
     "rewrite/ob_expand_aggregate_utils.h",
+    "rewrite/ob_fts_count_utils.h",
     "rewrite/ob_key_part.h",
     "rewrite/ob_predicate_deduce.h",
     "rewrite/ob_range_graph_generator.h",

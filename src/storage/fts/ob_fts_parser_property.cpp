@@ -21,6 +21,7 @@
 #include "common/json_type/ob_json_tree.h"
 #include "lib/list/ob_dlist.h"
 #include "lib/ob_errno.h"
+#include "share/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
@@ -1035,6 +1036,17 @@ int ObFTParserProperty::read_from_props(const ObFTParser &parser,
     dict_table_ = ObString(ObFTSLiteral::CONFIG_NAME_DICT_TABLE);
     stopword_table_ = ObString(ObFTSLiteral::CONFIG_NAME_STOPWORD_TABLE);
     quantifier_table_ = ObString(ObFTSLiteral::CONFIG_NAME_QUANTIFIER_TABLE);
+    // Keep eligibility separate from the legacy table-key placeholders above.
+    // A generation identifies the builtin data lifetime, not arbitrary tables.
+    auto builtin_table = [&](auto getter, const char *builtin) {
+      ObString table;
+      const int check = (props.*getter)(table);
+      return check == OB_SEARCH_NOT_FOUND || (check == OB_SUCCESS && table == ObString(builtin));
+    };
+    builtin_ik_dictionary_ = use_defaults || (
+        builtin_table(&ObFTParserJsonProps::config_get_dict_table, ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE)
+        && builtin_table(&ObFTParserJsonProps::config_get_quantifier_table, ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE)
+        && builtin_table(&ObFTParserJsonProps::config_get_stopword_table, ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE));
     ObString ik_smart;
     if (use_defaults) {
       ik_mode_smart_ = true;
@@ -1083,6 +1095,7 @@ ObFTParserProperty::ObFTParserProperty()
       max_token_size_(ObFTSLiteral::FT_DEFAULT_MAX_TOKEN_SIZE),
       ngram_token_size_(ObFTSLiteral::FT_DEFAULT_NGRAM_TOKEN_SIZE),
       ik_mode_smart_(true),
+      builtin_ik_dictionary_(false),
       stopword_table_(),
       dict_table_(),
       quantifier_table_(),

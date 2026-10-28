@@ -45,7 +45,7 @@ public:
   void release_document()
   {
     reset_resource();
-    disable_default_pipeline();
+    disable_decoded_pipeline();
     fulltext_ = nullptr;
     fulltext_len_ = 0;
     cursor_ = 0;
@@ -79,10 +79,11 @@ public:
                 int64_t char_cnt,
                 ObIKTokenType type);
 
-  // Explicit DEFAULT-only builtin UTF8 pipeline; failure is an optimization miss.
-  bool enable_default_pipeline(uint64_t generation);
-  void disable_default_pipeline();
-  bool default_pipeline_enabled() const;
+  // Builtin UTF8 decoding/dictionary accelerator, independent of the output sink.
+  // Failure is an optimization miss; the untouched document remains on the DAT.
+  bool enable_decoded_pipeline(uint64_t generation);
+  void disable_decoded_pipeline();
+  bool decoded_pipeline_enabled() const;
   ob_wc_t current_unicode() const;
   int64_t char_offset(int64_t index) const;
   int64_t current_char_index() const;

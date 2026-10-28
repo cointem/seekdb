@@ -19,6 +19,8 @@
 #include "ob_string_diff_decoder.h"
 
 #include "ob_raw_decoder.h"
+#include "ob_short_string_diff_decoder.h"
+#include "lib/utility/ob_target_specific.h"
 
 namespace oceanbase
 {
@@ -157,8 +159,53 @@ int ObStringDiffDecoder::batch_decode(
       }
     }
 
-    // Fill string data
+    // Short fixed strings need neither one arena slot of at least 128 bytes
+    // per value nor two descriptor walks and several tiny memcpy calls per
+    // row. Build a byte permutation once and decode into compact owned slots.
     const uint16_t string_size = header_->string_size_;
+    if (OB_SUCC(ret) && ctx.is_fix_length() && !header_->is_hex_packing()
+        && string_size > 0 && string_size <= ShortStringDiffDecoder::WIDTH) {
+      char common_template[ShortStringDiffDecoder::WIDTH] = {};
+      uint8_t diff_positions[ShortStringDiffDecoder::WIDTH];
+      int64_t diff_count = 0;
+      int64_t offset = 0;
+      for (int64_t i = 0; i < header_->diff_desc_cnt_; ++i) {
+        const auto &desc = header_->diff_descs_[i];
+        if (desc.diff_) {
+          for (int64_t j = 0; j < desc.count_; ++j) {
+            diff_positions[diff_count++] = static_cast<uint8_t>(offset + j);
+          }
+        }
+        offset += desc.count_;
+      }
+      header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+          header_->common_data(), common_template);
+      bool use_x86_simd = false;
+#if defined(__x86_64__)
+      use_x86_simd = is_arch_supported(ObTargetArch::SSE42);
+#endif
+      const ShortStringDiffDecoder decoder(common_template, diff_positions, diff_count, use_x86_simd);
+      char *buf = nullptr;
+      if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(
+              ShortStringDiffDecoder::WIDTH * row_cap)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        const char *data_begin = reinterpret_cast<const char *>(col_data) + data_offset;
+        const char *data_end = data_begin + ctx.micro_block_header_->row_count_ * header_->length_;
+        for (int64_t i = 0; i < row_cap; ++i) {
+          if (!ctx.has_extend_value() || !datums[i].is_null()) {
+            const char *cell = data_begin + row_ids[i] * header_->length_;
+            char *result = buf + i * ShortStringDiffDecoder::WIDTH;
+            decoder.decode(cell, data_end - cell, result);
+            datums[i].pack_ = string_size;
+            datums[i].ptr_ = result;
+          }
+        }
+      }
+      return ret;
+    }
+
+    // Other encodings retain their general descriptor/hex reconstruction.
     const static uint16_t min_buf_size = 128;
     const int64_t buf_size = std::max(string_size, min_buf_size);
     char *buf = nullptr;

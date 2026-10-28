@@ -5,6 +5,7 @@ Uses an existing server only. The nonconstant parser expression selects the
 ordinary tree path, providing independent tokenization/normalization coverage.
 """
 import argparse
+import json
 import random
 import string
 import subprocess
@@ -54,6 +55,11 @@ def main():
     command = [args.client, '--no-defaults', '-h127.0.0.1', f'-P{args.port}', '-uroot',
                '-N', '-s', '--raw', '--default-character-set=utf8mb4', '--max-allowed-packet=64M']
     inputs = cases()
+    # ALL exercises the ordinary sink's repeat frequencies/doc length, while
+    # the nonconstant parser goes through the one-shot analyzer pipeline.
+    all_inputs = [(body, json.dumps([{"output": "all"}] + json.loads(config)), coll)
+                  for body, config, coll in inputs]
+    inputs += all_inputs
     actual = run(command, statements(inputs, False), args.timeout)
     expected = run(command, statements(inputs, True), args.timeout)
     assert actual == expected, 'fused BENG changed ordered token spellings/membership'

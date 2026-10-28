@@ -318,7 +318,7 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
                                  const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  if (ctx.default_pipeline_enabled()) { return ctx.match_main_dictionary(); }
+  if (ctx.decoded_pipeline_enabled()) { return ctx.match_main_dictionary(); }
 
   if (ObFTCharUtil::CharType::USELESS != type) {
     // handle previous hits_ first and then check from this char

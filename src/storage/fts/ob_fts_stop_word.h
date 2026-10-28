@@ -29,6 +29,10 @@ namespace storage
 
 class ObFTParserProperty;
 
+// True only when the charset's actual lowercase mapping leaves all bytes intact.
+bool ft_word_lower_identity(const ObCharsetInfo *cs, bool utf8,
+                            const char *word, int64_t length);
+
 #define FTS_STOP_WORD_MAX_LENGTH 10
 
 static const char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
@@ -104,13 +108,18 @@ public:
       const ObObjMeta &meta,
       const ObAddWordFlag &flag,
       common::ObIAllocator &allocator,
-      ObFTWordMap &word_map);
+      ObFTWordMap &word_map,
+      common::ObArenaAllocator *normalization = nullptr);
   ~ObAddWord() = default;
   int process_word(
       const char *word,
       const int64_t word_len,
       const int64_t char_cnt,
       const int64_t word_freq);
+  // Synchronous input view: normalize in reusable scratch and copy only newly
+  // retained spellings. No input/parser/scratch pointer escapes this method.
+  int process_word_view(const char *word, int64_t word_len,
+                         int64_t char_cnt, int64_t word_freq);
   virtual int64_t get_add_word_count() const { return non_stopword_cnt_; }
   VIRTUAL_TO_STRING_KV(
       K_(word_meta),
@@ -123,13 +132,17 @@ public:
 
 private:
   bool is_min_max_word(const int64_t c_len) const;
-  int casedown_word(const ObFTWord &src, ObFTWord &dst);
+  int process_word_impl(const char *word, int64_t word_len, int64_t char_cnt,
+                         int64_t word_freq, bool borrowed);
+  int casedown_word(const ObFTWord &src, ObFTWord &dst, bool borrowed);
   int check_stopword(const ObFTWord &word, bool &is_stopword);
-  int groupby_word(const ObFTWord &word, const int64_t word_cnt);
+  int groupby_word(const ObFTWord &word, int64_t word_cnt, bool borrowed);
+  int retain_word(const ObFTWord &word, ObFTWord &retained);
 private:
   ObObjMeta word_meta_;
   common::ObIAllocator &allocator_;
   ObFTWordMap &word_map_;
+  common::ObArenaAllocator *normalization_;
   int64_t min_max_word_cnt_;
   int64_t non_stopword_cnt_;
   int64_t stopword_cnt_;

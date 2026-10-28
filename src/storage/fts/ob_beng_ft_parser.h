@@ -29,7 +29,14 @@ namespace storage
 {
 
 class FTUniqueTerms;
+class ObAddWord;
 struct ObFTParserProperty;
+
+// Fused ASCII traversal with the ordinary frequency/document-length sink.
+// Unsupported input leaves the sink untouched and handled=false.
+int try_beng_ascii_segment(const ObCharsetInfo *cs, const ObFTParserProperty &property,
+                           const char *text, int64_t length, ObAddWord &add_word,
+                           bool &handled);
 
 // DEFAULT-expression-only fused collector. An unsupported document/charset
 // leaves terms untouched and handled=false, allowing the ordinary BENG replay.

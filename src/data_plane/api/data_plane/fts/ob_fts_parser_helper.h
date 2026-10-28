@@ -226,7 +226,7 @@ public:
 private:
   static int segment(
       const ObFTParserProperty &property,
-      const int64_t parser_version,
+      const ObFTParser &parser,
       const ObIFTParserDesc *parser_desc,
       const ObCharsetInfo *cs,
       const char *fulltext,

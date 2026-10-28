@@ -50,38 +50,6 @@ static bool ft_tokenize_profile_no_ac()
   return disabled;
 }
 
-// ob_casedn_utf8mb4 decodes, applies caseinfo->page[wc].tolower and
-// reencodes. For valid CJK characters whose actual table entry is identity,
-// both conversion and its temporary allocation can be skipped. Keep all other
-// non-ASCII scripts/charsets on ObCharset::tolower (including invalid UTF-8).
-static bool ft_unique_lower_identity(const ObCharsetInfo *cs, bool utf8,
-                                     const char *word, int64_t length)
-{
-  if (cs->mbminlen != 1) { return false; }
-  const unsigned char *cursor = reinterpret_cast<const unsigned char *>(word);
-  const unsigned char *end = cursor + length;
-  while (cursor < end) {
-    if (*cursor < 128) {
-      if (*cursor >= 'A' && *cursor <= 'Z') { return false; }
-      ++cursor;
-    } else {
-      if (!utf8 || nullptr == cs->caseinfo) { return false; }
-      ob_wc_t wc = 0;
-      const int bytes = cs->cset->mb_wc(cs, &wc, cursor, end);
-      if (bytes <= 0 || !((wc >= 0x3400 && wc <= 0x4DBF)
-          || (wc >= 0x4E00 && wc <= 0x9FFF) || (wc >= 0x20000 && wc <= 0x2FA1F))) {
-        return false;
-      }
-      if (wc <= cs->caseinfo->maxchar) {
-        const ObUnicaseInfoChar *page = cs->caseinfo->page[wc >> 8];
-        if (nullptr != page && page[wc & 0xFF].tolower != wc) { return false; }
-      }
-      cursor += bytes;
-    }
-  }
-  return true;
-}
-
 void FTUniqueTerms::reuse()
 {
   entries_.reuse();
@@ -392,7 +360,7 @@ class FTParserWorkspace
 {
 public:
   FTParserWorkspace(bool is_ik, ObFTDictHub *hub)
-      : objects_("FTParserObjects"), scratch_("FTParserScratch"),
+      : objects_("FTParserObjects"), scratch_("FTParserScratch"), normalization_("FTParserNorm"),
         ik_(objects_, hub, &scratch_), beng_(objects_), is_ik_(is_ik) {}
   int open(ObFTParserParam &param, ObITokenIterator *&iter)
   {
@@ -406,15 +374,17 @@ public:
     }
     return ret;
   }
-  bool enable_default_pipeline(uint64_t generation)
-  { return !is_ik_ || ik_.enable_default_pipeline(generation); }
+  bool enable_decoded_pipeline(uint64_t generation)
+  { return !is_ik_ || ik_.enable_decoded_pipeline(generation); }
   int next_view(ObITokenIterator *iter, const char *&word, int64_t &length,
                 int64_t &chars, int64_t &freq)
   {
     return is_ik_ ? iter->get_next_token(word, length, chars, freq)
                   : beng_.get_next_token_view(word, length, chars, freq);
   }
-  int64_t retained_bytes() const { return objects_.total() + scratch_.total(); }
+  ObArenaAllocator &normalization() { return normalization_; }
+  int64_t retained_bytes() const
+  { return objects_.total() + scratch_.total() + normalization_.total(); }
   void finish()
   {
     if (is_ik_) {
@@ -423,10 +393,15 @@ public:
     } else {
       beng_.clear_document();
     }
+    // Normalized views have already been retained by the document allocator.
+    // Bound exceptional long-token retention without disturbing live IK chains.
+    if (normalization_.total() > 256 * 1024) { normalization_.reset(); }
+    else { normalization_.reuse(); }
   }
 private:
   ObArenaAllocator objects_;
   ObArenaAllocator scratch_;
+  ObArenaAllocator normalization_;
   ObIKFTParser ik_;
   ObBEngFTParser beng_;
   bool is_ik_;
@@ -434,7 +409,7 @@ private:
 
 int ObFTParseHelper::segment(
     const ObFTParserProperty &property,
-    const int64_t parser_version,
+    const ObFTParser &parser,
     const ObIFTParserDesc *parser_desc,
     const ObCharsetInfo *cs,
     const char *ft,
@@ -444,7 +419,7 @@ int ObFTParseHelper::segment(
     FTParserWorkspace *workspace)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(parser_version < 0 || nullptr == parser_desc || nullptr == cs || nullptr == ft || 0 >= ft_len)) {
+  if (OB_UNLIKELY(!parser.is_valid() || nullptr == parser_desc || nullptr == cs || nullptr == ft || 0 >= ft_len)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     ObFTParserParam param;
@@ -453,26 +428,43 @@ int ObFTParseHelper::segment(
     param.cs_ = cs;
     param.fulltext_ = ft;
     param.ft_length_ = ft_len;
-    param.parser_version_ = parser_version;
+    param.parser_version_ = parser.get_parser_version();
     param.ngram_token_size_ = property.ngram_token_size_;
     param.ik_param_.mode_
         = (property.ik_mode_smart_ ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD);
     param.min_ngram_size_ = property.min_ngram_token_size_;
     param.max_ngram_size_ = property.max_ngram_token_size_;
 
-    if (OB_FAIL(nullptr == workspace ? parser_desc->segment(&param, iter) : workspace->open(param, iter))) {
+    bool handled = false;
+    if (nullptr != workspace && parser.is_beng()
+        && parser.get_parser_version() == ObFTParser::BUILTIN_VERSION) {
+      ret = try_beng_ascii_segment(cs, property, ft, ft_len, add_word, handled);
+    }
+    if (OB_FAIL(ret) || handled) {
+      // No parser state was opened. Every accepted ASCII occurrence has already
+      // reached the ordinary sink; unsupported input is still untouched.
+    } else if (OB_FAIL(nullptr == workspace ? parser_desc->segment(&param, iter) : workspace->open(param, iter))) {
     } else if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      if (nullptr != workspace && parser.is_ik() && property.builtin_ik_dictionary_
+          && parser.get_parser_version() == ObFTParser::BUILTIN_VERSION
+          && !ft_tokenize_profile_no_ac()) {
+        // The accelerator only changes character/dictionary traversal. Keep the
+        // ordinary iterator/arbitrator and frequency/document-length sink.
+        workspace->enable_decoded_pipeline(ObFTParseData::instance().generation());
+      }
       const char *word = nullptr;
       int64_t word_len = 0;
       int64_t char_cnt = 0;
       int64_t word_freq = 0;
       while (OB_SUCC(ret)) {
-        if (OB_FAIL(iter->get_next_token(word, word_len, char_cnt, word_freq))) {
+        if (OB_FAIL(nullptr == workspace ? iter->get_next_token(word, word_len, char_cnt, word_freq)
+                                        : workspace->next_view(iter, word, word_len, char_cnt, word_freq))) {
           if (OB_ITER_END != ret) {
           }
-        } else if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
+        } else if (OB_FAIL(nullptr == workspace ? add_word.process_word(word, word_len, char_cnt, word_freq)
+                                               : add_word.process_word_view(word, word_len, char_cnt, word_freq))) {
         }
       }
       if (OB_ITER_END == ret) {
@@ -598,10 +590,11 @@ int ObFTParseHelper::segment(
     if (words.size() > 0) {
       words.reuse();
     }
-    ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
+    ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words,
+                       nullptr == workspace_ ? nullptr : &workspace_->normalization());
     if (OB_FAIL(segment(
                     parser_property_,
-                    parser_name_.get_parser_version(),
+                    parser_name_,
                     parser_desc_,
                     cs,
                     fulltext,
@@ -662,7 +655,7 @@ int ObFTParseHelper::segment_unique(const ObObjMeta &meta, const char *fulltext,
   const bool utf8 = ObCharset::charset_type_by_coll(meta.get_collation_type()) == CHARSET_UTF8MB4;
   if (OB_FAIL(workspace_->open(param, iter))) {
   } else if (parser_name_.is_ik() && !ft_tokenize_profile_no_ac()
-      && !workspace_->enable_default_pipeline(ObFTParseData::instance().generation())) {
+      && !workspace_->enable_decoded_pipeline(ObFTParseData::instance().generation())) {
     // Unsupported input, cold-build/OOM/budget miss: no terms have escaped.
     fallback = true;
   } else {
@@ -677,7 +670,7 @@ int ObFTParseHelper::segment_unique(const ObObjMeta &meta, const char *fulltext,
       } else {
         ObString normalized(length, word);
         if (add_word_flag_.casedown()) {
-          if (!ft_unique_lower_identity(cs, utf8, word, length)) {
+          if (!ft_word_lower_identity(cs, utf8, word, length)) {
             normalization.reuse();
             ret = ObCharset::tolower(meta.get_collation_type(), ObString(length, word),
                                      normalized, normalization);

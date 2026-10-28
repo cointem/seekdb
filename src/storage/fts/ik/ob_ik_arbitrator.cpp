@@ -161,7 +161,7 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
           // output single word between two token
           while (OB_SUCC(ret) && current < token.offset_) {
             ObFTCharUtil::CharType unused_type;
-            if (OB_FAIL((ctx.default_pipeline_enabled()
+            if (OB_FAIL((ctx.decoded_pipeline_enabled()
                     ? ctx.read_char(current, char_len, unused_type)
                     : ObCharset::first_valid_char(ctx.collation(), ctx.fulltext() + current,
                                                   ctx.fulltext_len() - current, char_len)))) {

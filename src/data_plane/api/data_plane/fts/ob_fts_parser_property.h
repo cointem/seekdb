@@ -147,7 +147,8 @@ public:
            && stopword_table_ == other.stopword_table_ && dict_table_ == other.dict_table_
            && quantifier_table_ == other.quantifier_table_
            && min_ngram_token_size_ == other.min_ngram_token_size_
-           && max_ngram_token_size_ == other.max_ngram_token_size_;
+           && max_ngram_token_size_ == other.max_ngram_token_size_
+           && builtin_ik_dictionary_ == other.builtin_ik_dictionary_;
   }
 
   TO_STRING_KV(K_(min_token_size),
@@ -165,6 +166,8 @@ public:
   int64_t max_token_size_;
   int64_t ngram_token_size_;
   bool ik_mode_smart_;
+  // True only for explicitly validated builtin/default IK dictionaries.
+  bool builtin_ik_dictionary_;
   common::ObString stopword_table_;
   common::ObString dict_table_;
   common::ObString quantifier_table_;

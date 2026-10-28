@@ -395,12 +395,6 @@ public:
   // Only the non-partitioned FTS direct writer opts in. Array rows already
   // belong to datum_store_; decoded merge rows need batch-owned storage.
   void enable_fts_stable_output_batch() { fts_stable_output_batch_ = true; }
-  bool use_fts_prescan_handoff() const { return fts_stable_output_batch_; }
-  int init_fts_prescan();
-  int add_fts_prescan_batch(const common::ObIArray<ObExpr *> &exprs,
-                          const ObBitVector &skip, int64_t batch_size);
-  int finish_fts_prescan();
-
   // rewind get_next_row() iterator to begin.
   int rewind();
 
@@ -689,7 +683,7 @@ protected:
   bool need_imms() const
   {
     return !use_heap_sort_ && !use_partition_topn_sort_
-           && rows_->count() > datum_store_.get_row_cnt() + fts_prescan_run_rows_;
+           && rows_->count() > datum_store_.get_row_cnt();
   }
   int sort_inmem_data();
   int do_dump();
@@ -893,15 +887,7 @@ protected:
   ObPushDownTopNFilter pd_topn_filter_;
   bool fts_stable_output_batch_;
   common::ObArenaAllocator fts_output_arena_;
-  // Native spill rows are the sort input, not an intermediate serialization
-  // to decode and copy again. The iterator must outlive both block holders.
-  int64_t fts_prescan_run_rows_;
-  ObChunkDatumStore fts_prescan_store_;
-  ObChunkDatumStore::Iterator fts_prescan_iter_;
-  ObChunkDatumStore::IteratedBlockHolder fts_prescan_pending_blocks_;
-  ObChunkDatumStore::IteratedBlockHolder fts_prescan_owned_blocks_;
-  void adopt_fts_prescan_blocks();
-  void reset_fts_prescan();
+
 };
 
 class ObInMemoryTopnSortImpl;

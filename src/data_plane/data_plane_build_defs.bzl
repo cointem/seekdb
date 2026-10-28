@@ -40,6 +40,7 @@ DATA_PLANE_API_INTERFACE_HEADERS = [
     "api/data_plane/fts/ob_fts_parser_name.h",
     "api/data_plane/fts/ob_fts_parser_property.h",
     "api/data_plane/fts/ob_fts_struct.h",
+    "api/data_plane/fts/ob_fts_unique_terms.h",
     "api/data_plane/lob/ob_json_lob.h",
     "api/data_plane/lob/ob_lob_access_context.h",
     "api/data_plane/lob/ob_lob_read.h",

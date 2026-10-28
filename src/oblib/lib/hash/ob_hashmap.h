@@ -333,6 +333,24 @@ public:
     }
     return ret;
   };
+  // One lookup with deferred ownership preparation on insertion. Both
+  // callbacks return an error code and run under the bucket write lock; they
+  // must not re-enter this table. prepare may replace borrowed storage in the
+  // local pair, but must preserve the key's hash/equality. Nothing is published
+  // if prepare fails. Existing-key failures are propagated unchanged.
+  template <class _callback, class _prepare>
+  int set_or_update(const _key_type &key, const _value_type &value,
+                    _callback &callback, _prepare &prepare)
+  {
+    int ret = OB_SUCCESS;
+    pair_type pair;
+    if (OB_FAIL(pair.init(key, value))) {
+      HASH_WRITE_LOG(HASH_WARNING, "init pair failed, ret=%d", ret);
+    } else {
+      ret = ht_.set_or_update_with_prepare(key, pair, callback, prepare);
+    }
+    return ret;
+  };
   // erase key value pair if pred is met
   // thread safe erase, will add write lock to the bucket
   // return value:

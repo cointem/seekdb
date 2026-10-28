@@ -54,8 +54,8 @@ public:
   int restart(const ObFTParserParam &param);
   void clear_document();
 
-  bool enable_default_pipeline(uint64_t generation)
-  { return nullptr != ctx_ && ctx_->enable_default_pipeline(generation); }
+  bool enable_decoded_pipeline(uint64_t generation)
+  { return nullptr != ctx_ && ctx_->enable_decoded_pipeline(generation); }
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
