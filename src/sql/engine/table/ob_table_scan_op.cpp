@@ -1546,6 +1546,8 @@ int ObTableScanOp::inner_open()
 int ObTableScanOp::inner_close()
 {
   int ret = OB_SUCCESS;
+  profile_scan_rows_.flush();
+  profile_scan_batches_.flush();
   if (OB_NOT_NULL(scan_iter_)) {
     if (scan_iter_->has_task()) {
       int tmp_ret = fill_storage_feedback_info();
@@ -2263,12 +2265,14 @@ ERRSIM_POINT_DEF(EN_TABLE_SCAN_RETRY_WAIT_EVENT_ERRSIM);
 int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
+  const int64_t profile_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   if (OB_UNLIKELY(rand_scan_processor_.use_rand_scan())) {
     if (OB_FAIL(rand_scan_processor_.inner_get_next_batch(max_row_cnt))) {
     }
   } else if (OB_FAIL(inner_get_next_batch_for_tsc(max_row_cnt))) {
   }
 
+  profile_scan_batches_.add(profile_start, ret == OB_SUCCESS ? brs_.size_ : 0, ret == OB_ITER_END ? 0 : ret);
   return ret;
 }
 
@@ -3060,6 +3064,7 @@ int ObTableScanOp::do_diagnosis(ObExecContext &exec_ctx, ObBitVector &skip)
 int ObTableScanOp::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
+  const int64_t profile_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
   if (OB_UNLIKELY(MY_SPEC.is_spatial_ddl())) {
     if (OB_FAIL(inner_get_next_spatial_index_row())) {
       if (ret != OB_ITER_END) {
@@ -3098,6 +3103,7 @@ int ObTableScanOp::inner_get_next_row()
     }
   }
 #endif
+  profile_scan_rows_.add(profile_start, ret == OB_SUCCESS ? 1 : 0, ret == OB_ITER_END ? 0 : ret);
   return ret;
 }
 

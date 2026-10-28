@@ -135,3 +135,8 @@ The no-GPU DDL contract remains covered by
 - GPU validation is manual because upstream CI has no compatible GPU runner.
 - Multi-GPU, long-duration, and snapshot-reload coverage are out of scope for
   this phase.
+
+## Source-level performance profiling
+
+See [profiling.md](profiling.md) for opt-in phase timings, a repeatable SQL
+workload and JSON/CSV reports for baseline/candidate comparisons.

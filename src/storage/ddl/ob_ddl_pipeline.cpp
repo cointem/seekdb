@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_ddl_pipeline.h"
+#include "lib/vector/seekdb_vector_profile.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/api/storage/vector/ob_i_vector_index_runtime.h"
 #include "storage/ddl/ob_ddl_tablet_context.h"
@@ -962,13 +963,19 @@ int ObHNSWIndexAppendBufferOperator::append_row(
 int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObDDLTabletContext *tablet_context)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("ddl.read_and_append", this, ret);
   ObBatchDatumRows *datum_rows = nullptr;
+  VectorProfileCounter reads("ddl.read_tmp_batches", this);
+  VectorProfileCounter appends("ddl.decode_and_add_rows", this);
   if (OB_ISNULL(row_file) || OB_ISNULL(tablet_context)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), KP(row_file), KP(tablet_context));
   }
   while (OB_SUCC(ret)) {
-    if (OB_FAIL(row_file->get_next_batch(datum_rows))) {
+    const int64_t read_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
+    const int read_ret = row_file->get_next_batch(datum_rows);
+    reads.add(read_start, read_ret == OB_SUCCESS ? datum_rows->row_count_ : 0, read_ret == OB_ITER_END ? 0 : read_ret);
+    if (OB_FAIL(read_ret)) {
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
         break;
@@ -978,10 +985,12 @@ int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObD
     } else {
       const ObArray<common::ObIVector *> &vectors = datum_rows->vectors_;
       const int64_t total_row_count = datum_rows->row_count_;
+      const int64_t append_start = seekdb_vprofile_enabled() ? seekdb_vprofile_now() : 0;
       for (int64_t i = 0; OB_SUCC(ret) && i < total_row_count; ++i) {
         if (OB_FAIL(append_row(i, vectors, tablet_context))) {
         }
       }
+      appends.add(append_start, total_row_count, ret);
     }
   }
   return ret;
@@ -993,6 +1002,7 @@ int ObHNSWIndexAppendBufferOperator::execute(
     ObChunk &output_chunk)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("ddl.append_pipeline", this, ret);
   result_state = ObPipelineOperator::NEED_MORE_INPUT;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -1047,6 +1057,7 @@ int ObHNSWIndexBuildOperator::serialize_vector_index(
     ObVectorIndexTabletContext &ctx)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("ddl.serialize_index", this, ret);
   // first we do vsag serialize
   ObIVectorIndexRuntime *vec_index_service = ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
   ObPluginVectorIndexAdapterGuard adaptor_guard;
@@ -1112,6 +1123,7 @@ int ObHNSWIndexBuildOperator::execute(
     ObChunk &output_chunk)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("ddl.build_and_serialize", this, ret);
   int end_trans_ret = OB_SUCCESS;
   ObDDLTabletContext *tablet_context = nullptr;
   output_chunk.reset();
@@ -1219,6 +1231,7 @@ int ObHNSWIndexWriteMacroOperator::execute(
     ObChunk &output_chunk)
 {
   int ret = OB_SUCCESS;
+  VectorProfileScope profile("ddl.write_macros", this, ret);
   output_chunk.reset();
   result_state = ObPipelineOperator::NEED_MORE_INPUT;
   if (OB_FAIL(write(input_chunk, iter_))) {
